@@ -1,0 +1,352 @@
+// trexport.nv — where a finished span goes, and what sending it costs.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `TracingExporter[e]` IS THE LOAD-BEARING INTERFACE, and the effect
+// parameter is why.  An exporter over HTTP costs `[net]`, one over a
+// unix socket costs `[io]`, one that writes a file costs `[fs]`, and one
+// a test drains into a list costs NOTHING — so a pipeline written once
+// against the trait is charged exactly what the caller's own exporter
+// costs.  An enum of exporters would charge every caller the union,
+// which means a test asserting on the spans a library produced would be
+// charged `[net]` for a collector it never reaches.
+//
+// EXPORT TAKES A BATCH, NOT A SPAN, AND THE SIGNATURE SAYS SO.  The
+// OTLP protocol is defined over a batch; a collector receiving one span
+// per request is the commonest way a traced service becomes slower than
+// the service it is tracing.  An exporter that only wants one span still
+// gets a list of one, and nothing in the interface lets a caller send
+// them one at a time by mistake.
+//
+// EXPORT NEVER FAILS THE CALLER'S WORK.  `TrExportOutcome` reports how
+// many spans went and how many were dropped, and the ONE error path is
+// about the exporter itself rather than about the request being traced.
+// The specification is explicit that telemetry must not affect the
+// application, and `std.otlp`'s own page says the same thing in one
+// line: "network failures are swallowed, so adding telemetry to a
+// library won't crash callers whose collector is offline."
+//
+// THE QUEUE IS A VALUE AND THE FLUSH IS THE CALLER'S.  A batch processor
+// in an imperative library is a background thread with a lock; here
+// `TrBatch` is a value a caller pushes into and drains, and the decision
+// "is it time to send" is `should_flush`, which takes the clock reading
+// rather than reading one.  A service that already has a loop puts the
+// drain in it; one that does not gets exactly the shape of the problem
+// it has to solve, rather than a thread it did not ask for.
+
+// Why an exporter could not send.
+//
+// Four, and none of them is "the span was bad": a span this package
+// built is well formed by construction, and one it did not build is not
+// this exporter's problem to diagnose.
+pub enum TrExportFault
+    // The collector was unreachable, refused, or timed out.  `detail`
+    // is for a person; the retry decision is the caller's, because only
+    // the caller knows whether it has anywhere to put the spans
+    // meanwhile.
+    TrExportUnreachable(detail: Str)
+    // The collector answered, and said no.  `status` is its HTTP status
+    // or protocol code — a 400 is a bug in this encoder and a 429 is
+    // back-pressure, and a caller that treated them alike would retry
+    // the first forever.
+    TrExportRefused(status: Int, detail: Str)
+    // The exporter was shut down before this batch arrived.
+    TrExportClosed
+    // The batch was larger than the exporter's own limit.  `limit` is
+    // what it would have taken, so a caller can split rather than
+    // guess.
+    TrExportTooLarge(count: Int, limit: Int)
+
+// The standard `Error` implementation, so a failed export can be
+// reported by anything that reports errors.
+impl Error for TrExportFault
+    // One line: what could not be sent, and why.
+    //
+    // A refusal names the status, because a 400 and a 429 lead to
+    // opposite actions and "export failed" leads to neither.
+    fn message(self) -> Str
+        todo("tracing-nv.trexport.TrExportFault.message")
+
+// What one export did.
+//
+// Counts rather than a bare `Result`, because a partial send is the
+// ordinary outcome — a collector that took 400 of 500 spans and then
+// applied back-pressure — and a `Result` has two shapes to put that in,
+// both of which lose the number.
+pub struct TrExportOutcome
+    sent: Int
+    // Spans this exporter discarded: over a limit, or past a deadline.
+    dropped: Int
+    fault: ?TrExportFault
+
+// Where finished spans go.
+//
+// The trait binds one effect parameter, `e`, and every member uses it
+// (SPEC § 5.6 requires both).  An impl supplies the set its own
+// implementation actually costs: `impl TracingExporter[net]` for the
+// OTLP/HTTP one in `trotlp`, `impl TracingExporter[fs]` for a file,
+// `impl TracingExporter[]` for the in-memory one here.
+pub trait TracingExporter[e]
+    // Send a batch.  A batch of one is legal and a batch of none is a
+    // no-op that answers zero.
+    fn export(self, spans: [TrSpan]) -> TrExportOutcome [e]
+    // Send anything held, and answer what it did.
+    //
+    // Called on the way out of a program, and it is the call whose
+    // absence is why the last few seconds of a crashed service are
+    // missing from every trace backend anybody has ever operated.
+    fn flush(self) -> TrExportOutcome [e]
+    // Stop accepting.  An exporter that is already shut down answers an
+    // outcome carrying `TrExportClosed` rather than failing, because
+    // shutting down twice is what a signal handler and a `main` that
+    // both try to be tidy will do.
+    fn shutdown(self) -> TrExportOutcome [e]
+
+// An exporter that keeps the spans in a slot the caller owns.
+//
+// `impl TracingExporter[mutate]`, and it is the one every test uses: a
+// service's instrumentation runs unchanged, and the assertion is on the
+// spans in the slot rather than on a collector's logs.
+pub struct TrMemoryExporter
+    slot: Int
+    // The most spans to keep; older ones are dropped and counted.
+    cap: Int
+
+// Keeping spans in a caller's slot costs `[mutate]` and nothing else.
+impl TracingExporter[mutate] for TrMemoryExporter
+    // Put the batch in the slot.
+    fn export(self, spans: [TrSpan]) -> TrExportOutcome [mutate]
+        todo("tracing-nv.trexport.TrMemoryExporter.export")
+
+    // Nothing is held back, so nothing is pushed.
+    fn flush(self) -> TrExportOutcome [mutate]
+        todo("tracing-nv.trexport.TrMemoryExporter.flush")
+
+    // Stop accepting; the spans stay in the slot for the test to read.
+    fn shutdown(self) -> TrExportOutcome [mutate]
+        todo("tracing-nv.trexport.TrMemoryExporter.shutdown")
+
+// How a batch decides it is full.
+//
+// The three bounds the specification's batch span processor defines, and
+// they are all three because each catches a different failure: a busy
+// service fills `max_batch` in milliseconds, a quiet one would hold its
+// only span until it shut down without `max_delay_seconds`, and a
+// service whose collector is down would grow without `max_queue`.
+pub struct TrBatchLimits
+    // Send once this many spans are queued.
+    max_batch: Int
+    // Send once the oldest queued span is this old.
+    max_delay_seconds: Float
+    // Drop rather than queue past this.  The one bound that loses data
+    // on purpose, because the alternative is losing the process.
+    max_queue: Int
+
+// Spans waiting to be sent.
+//
+// A value, so a caller owns the queue and the scheduling.  `oldest_unix`
+// is the instant the first queued span arrived — kept rather than read
+// off the queue's head, because a caller that drained part of the batch
+// still needs the age of what is left.
+pub struct TrBatch
+    spans: [TrSpan]
+    limits: TrBatchLimits
+    oldest_unix: Float
+    // Spans this batch discarded because the queue was full, since the
+    // last successful drain.
+    dropped: Int
+
+// The specification's defaults: 512 spans, 5 seconds, 2048 queued.
+//
+// ```novo
+// use trexport
+//
+// fn main() [io]
+//     println("${trexport.default_limits().max_batch}")
+// ```
+pub fn default_limits() -> TrBatchLimits []
+    todo("tracing-nv.trexport.default_limits")
+
+// Limits a caller chose.
+//
+// ```novo
+// use trexport
+//
+// fn main() [io]
+//     println("${trexport.limits(128, 1.0, 4096).max_queue}")
+// ```
+pub fn limits(max_batch: Int, max_delay_seconds: Float, max_queue: Int) -> TrBatchLimits []
+    todo("tracing-nv.trexport.limits")
+
+// An empty batch under these limits.
+//
+// ```novo
+// use trexport
+//
+// fn main() [io]
+//     println("${trexport.batch(trexport.default_limits()).dropped}")
+// ```
+pub fn batch(l: TrBatchLimits) -> TrBatch []
+    todo("tracing-nv.trexport.batch")
+
+// The batch with this span queued, or with it dropped and counted.
+//
+// A span that is not sampled is not queued at all and is not counted as
+// dropped, because it was never meant to travel — counting it would put
+// a number in an operator's dashboard that means "sampling is working".
+//
+// ```novo
+// use trexport
+//
+// fn queue(b: TrBatch, s: TrSpan) -> TrBatch
+//     trexport.push(b, s, 1757548800.0)
+//
+// fn main() [io]
+//     println("a span, queued")
+// ```
+pub fn push(b: TrBatch, s: TrSpan, now_unix: Float) -> TrBatch []
+    todo("tracing-nv.trexport.push")
+
+// Is it time to send?
+//
+// `[]`, and the clock reading is a parameter — which is what lets a test
+// assert that a quiet service sends after its delay without waiting for
+// one.
+//
+// ```novo
+// use trexport
+//
+// fn due(b: TrBatch) -> Bool
+//     trexport.should_flush(b, 1757548805.0)
+//
+// fn main() [io]
+//     println("whether a batch is due")
+// ```
+pub fn should_flush(b: TrBatch, now_unix: Float) -> Bool []
+    todo("tracing-nv.trexport.should_flush")
+
+// The spans to send and the emptied batch.
+//
+// The pair rather than two calls: a drain that left the caller to empty
+// it separately loses whatever was queued in between, and in a service
+// that traces from more than one place that is every drain.
+//
+// ```novo
+// use trexport
+//
+// fn take(b: TrBatch) -> ([TrSpan], TrBatch)
+//     trexport.drain(b)
+//
+// fn main() [io]
+//     println("the spans due, taken")
+// ```
+pub fn drain(b: TrBatch) -> ([TrSpan], TrBatch) []
+    todo("tracing-nv.trexport.drain")
+
+// Drain the batch into an exporter, answering what it did.
+//
+// THE ROW IS `[e]`: the pipeline is written once and costs what the
+// caller's own exporter costs.  This is the call inside a service's own
+// loop, and the reason `TracingExporter` is a trait.
+//
+// ```novo
+// use trexport
+//
+// fn ship<X: trexport.TracingExporter[e]>(b: TrBatch, x: X) -> (TrExportOutcome, TrBatch) [e]
+//     trexport.flush_into(b, x)
+//
+// fn main() [io]
+//     println("a batch, sent, charged what the exporter costs")
+// ```
+pub fn flush_into<X: TracingExporter[e]>(b: TrBatch, x: X) -> (TrExportOutcome, TrBatch) [e]
+    todo("tracing-nv.trexport.flush_into")
+
+// Drain the batch into an exporter if it is due, and answer what it did.
+//
+// The one call a service's loop makes per iteration.  A batch that is
+// not due answers a zero outcome and the batch unchanged, so the loop
+// has no branch in it.
+//
+// ```novo
+// use trexport
+//
+// fn tick<X: trexport.TracingExporter[e]>(b: TrBatch, x: X,
+//                                         now: Float) -> (TrExportOutcome, TrBatch) [e]
+//     trexport.flush_if_due(b, x, now)
+//
+// fn main() [io]
+//     println("one iteration of a service's export loop")
+// ```
+pub fn flush_if_due<X: TracingExporter[e]>(b: TrBatch, x: X,
+                                           now_unix: Float) -> (TrExportOutcome, TrBatch) [e]
+    todo("tracing-nv.trexport.flush_if_due")
+
+// An in-memory exporter over a slot the caller owns.
+//
+// ```novo
+// use trexport
+//
+// fn main() [io]
+//     println("${trexport.memory_exporter(0, 1024).cap}")
+// ```
+pub fn memory_exporter(slot: Int, cap: Int) -> TrMemoryExporter []
+    todo("tracing-nv.trexport.memory_exporter")
+
+// The spans an in-memory exporter is holding.
+//
+// ```novo
+// use trexport
+//
+// fn seen(x: TrMemoryExporter) -> [TrSpan] [mutate]
+//     trexport.exported_spans(x)
+//
+// fn main() [io]
+//     println("what a test's exporter received")
+// ```
+pub fn exported_spans(x: TrMemoryExporter) -> [TrSpan] [mutate]
+    todo("tracing-nv.trexport.exported_spans")
+
+// An outcome that sent nothing and failed at nothing.
+//
+// ```novo
+// use trexport
+//
+// fn main() [io]
+//     println("${trexport.no_outcome().sent}")
+// ```
+pub fn no_outcome() -> TrExportOutcome []
+    todo("tracing-nv.trexport.no_outcome")
+
+// Did this outcome get everything through?
+//
+// `sent > 0`, nothing dropped and no fault.  Published because the
+// three-part check is what a service's own health line reports and a
+// two-part one reads a partial send as a success.
+//
+// ```novo
+// use trexport
+//
+// fn main() [io]
+//     println("${trexport.outcome_is_clean(trexport.no_outcome())}")
+// ```
+pub fn outcome_is_clean(o: TrExportOutcome) -> Bool []
+    todo("tracing-nv.trexport.outcome_is_clean")
+
+// Is this fault worth trying again?
+//
+// Unreachable and a 429 or a 5xx refusal, yes; a 4xx refusal, a closed
+// exporter and an over-size batch, no.  Published rather than left to
+// each caller, because retrying a 400 forever is how a broken encoder
+// becomes an outage at the collector rather than a line in a log.
+//
+// ```novo
+// use trexport
+//
+// fn again(f: TrExportFault) -> Bool
+//     trexport.is_retryable(f)
+//
+// fn main() [io]
+//     println("whether a failed export is worth repeating")
+// ```
+pub fn is_retryable(f: TrExportFault) -> Bool []
+    todo("tracing-nv.trexport.is_retryable")

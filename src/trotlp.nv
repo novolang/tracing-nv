@@ -1,0 +1,347 @@
+// trotlp.nv — the OTLP/JSON encoding, and the one exporter that ships.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE ENCODING IS PURE AND THE SEND IS NOT, AND THEY ARE SEPARATE
+// FUNCTIONS.  `encode` answers the exact JSON document a collector
+// receives, at `[]`, so a test asserts on the bytes without a collector
+// and a caller with its own transport — a unix socket, a queue, a file
+// somebody rotates — uses the encoding without taking `[net]`.  Only
+// `send` and the exporter impl are `[net]`.
+//
+// WHAT `std.otlp` KEEPS.  The standard library ships an OTLP module and
+// it is not replaced:
+//
+//   - `otlp.record_metric` KEEPS metrics entirely.  This package is
+//     about traces; a metric is a different signal with a different
+//     document, and duplicating it here would give a program two
+//     endpoints to configure.
+//   - `otlp.enabled` and `otlp.endpoint` KEEP the configuration
+//     convention — `OTLP_ENDPOINT`, `OTLP_SERVICE`, and `off` to
+//     disable — read at call time so a test can flip them per scope.
+//     `trotlp.endpoint_from_env` answers the same value from the same
+//     variables rather than inventing a second spelling.
+//   - `otlp.with_span` is DEFERRED in the standard library and needs
+//     closure support, and that deferral is the gap this package
+//     closes: a span here is a VALUE, so `start` and `finish` are two
+//     ordinary calls and nothing has to be wrapped in a thunk.  A
+//     library built on `with_span` would inherit the deferral.
+//
+// JSON RATHER THAN PROTOBUF, and the reason is honest rather than
+// principled: OTLP defines both over HTTP, every collector accepts
+// JSON, and protobuf would want a `protobuf-nv` dependency and a
+// generated schema this package has no way to check against the
+// specification.  The cost is size — a JSON span is roughly three times
+// its protobuf — and it is named in the README rather than discovered
+// from an egress bill.
+
+use trspan
+
+// The resource attributes every span in a document is reported under.
+//
+// `service_name` is separate from the rest because OTLP requires it and
+// a collector that receives a document without it files the spans under
+// `unknown_service`, which is where telemetry goes to be ignored.
+pub struct TrResource
+    service_name: Str
+    // `service.version`, `deployment.environment`, `host.name` and
+    // whatever else the operator wants on every span.
+    attributes: [TrAttr]
+
+// What produced the spans: this library's name and version.
+//
+// OTLP's `InstrumentationScope`.  A backend uses it to tell a service's
+// own spans from those an HTTP client library produced, which is the
+// difference between "our code is slow" and "the library we call is".
+pub struct TrScope
+    name: Str
+    version: Str
+
+// An OTLP/HTTP exporter.
+//
+// Holds the endpoint and the resource, so the emit path consults one
+// value and a program's configuration is read once.
+pub struct TrOtlpExporter
+    // The collector's base URL; `/v1/traces` is appended.
+    endpoint: Str
+    resource: TrResource
+    scope: TrScope
+    // Seconds before a send gives up.  A telemetry exporter with no
+    // deadline is how a slow collector becomes a slow service.
+    timeout_seconds: Float
+    // The most spans in one document.
+    max_batch: Int
+
+// Sending to a collector costs `[net]`, which is what the impl head
+// declares.
+impl TracingExporter[net] for TrOtlpExporter
+    // Encode the batch and POST it.
+    //
+    // A batch larger than `max_batch` is refused with
+    // `TrExportTooLarge` naming the limit rather than silently split,
+    // because splitting changes how many requests a collector sees and
+    // that is the caller's decision to make.
+    fn export(self, spans: [TrSpan]) -> TrExportOutcome [net]
+        todo("tracing-nv.trotlp.TrOtlpExporter.export")
+
+    // Nothing is held between calls — the batching is `trexport`'s — so
+    // this answers a zero outcome.  Declared anyway, because the trait
+    // requires it and because a caller that calls it on the way out
+    // should not have to know which exporter holds state.
+    fn flush(self) -> TrExportOutcome [net]
+        todo("tracing-nv.trotlp.TrOtlpExporter.flush")
+
+    // Stop accepting.
+    fn shutdown(self) -> TrExportOutcome [net]
+        todo("tracing-nv.trotlp.TrOtlpExporter.shutdown")
+
+// The OTLP/JSON document for these spans.
+//
+// `[]`, and it is the function the test suite spends its cases on: the
+// nesting a collector requires is three levels deep
+// (`resourceSpans` / `scopeSpans` / `spans`) and every hand-rolled
+// encoder gets one of them wrong, producing a document that is accepted
+// with a 200 and contains no spans.
+//
+// ```novo
+// use trotlp
+//
+// fn body(r: TrResource, sc: TrScope, spans: [TrSpan]) -> Str
+//     trotlp.encode(r, sc, spans)
+//
+// fn main() [io]
+//     println("the document a collector receives")
+// ```
+pub fn encode(resource: TrResource, scope: TrScope, spans: [TrSpan]) -> Str []
+    todo("tracing-nv.trotlp.encode")
+
+// One span as its OTLP/JSON object, without the wrapper.
+//
+// Published because it is the unit a test compares and the unit a
+// caller with its own batching composes.
+//
+// ```novo
+// use trotlp
+//
+// fn one(s: TrSpan) -> Str
+//     trotlp.encode_span(s)
+//
+// fn main() [io]
+//     println("one span, as OTLP JSON")
+// ```
+pub fn encode_span(s: TrSpan) -> Str []
+    todo("tracing-nv.trotlp.encode_span")
+
+// A Unix epoch second as the nanosecond string OTLP wants.
+//
+// A STRING, and that is the rule this function exists to keep.  OTLP
+// timestamps are `fixed64` nanoseconds, which is past 2^53 for any date
+// after 1970 — so a JSON number loses precision in every consumer with
+// IEEE doubles, and the protocol's own JSON mapping says a 64-bit
+// integer is encoded as a decimal string.  An encoder that wrote a
+// number produces timestamps that are wrong by microseconds, which is
+// invisible until somebody orders two spans by start time.
+//
+// ```novo
+// use trotlp
+//
+// fn main() [io]
+//     println(trotlp.nanos_of(1757548800.0))
+// ```
+pub fn nanos_of(unix_seconds: Float) -> Str []
+    todo("tracing-nv.trotlp.nanos_of")
+
+// The span kind as the OTLP enum number.
+//
+// `SPAN_KIND_INTERNAL` is 1, not 0 — 0 is `UNSPECIFIED` — and an
+// encoder that used the enum's position writes every internal span as
+// unspecified, which a backend shows as a span with no kind.
+//
+// ```novo
+// use trotlp
+//
+// fn main() [io]
+//     println("${trotlp.kind_code(TrServer)}")
+// ```
+pub fn kind_code(k: TrSpanKind) -> Int []
+    todo("tracing-nv.trotlp.kind_code")
+
+// The status code as the OTLP enum number.
+//
+// ```novo
+// use trotlp
+//
+// fn main() [io]
+//     println("${trotlp.status_code(TrError)}")
+// ```
+pub fn status_code(c: TrStatusCode) -> Int []
+    todo("tracing-nv.trotlp.status_code")
+
+// One attribute as its OTLP `KeyValue` object.
+//
+// OTLP wraps every value in a one-key object naming its type —
+// `{"key":"n","value":{"intValue":"7"}}` — and an integer inside it is
+// a STRING for the same 64-bit reason `nanos_of` exists.
+//
+// ```novo
+// use trotlp
+// use trspan
+//
+// fn main() [io]
+//     println(trotlp.encode_attr(trspan.attr_int("http.status_code", 200)))
+// ```
+pub fn encode_attr(a: TrAttr) -> Str []
+    todo("tracing-nv.trotlp.encode_attr")
+
+// A resource: a service name and the attributes every span carries.
+//
+// ```novo
+// use trotlp
+//
+// fn main() [io]
+//     println(trotlp.resource("checkout", []).service_name)
+// ```
+pub fn resource(service_name: Str, attributes: [TrAttr]) -> TrResource []
+    todo("tracing-nv.trotlp.resource")
+
+// This package, as the scope a backend attributes spans to.
+//
+// ```novo
+// use trotlp
+//
+// fn main() [io]
+//     println(trotlp.this_scope().name)
+// ```
+pub fn this_scope() -> TrScope []
+    todo("tracing-nv.trotlp.this_scope")
+
+// A scope a caller names.
+//
+// What an instrumentation library passes, so its spans are
+// distinguishable from the application's.
+//
+// ```novo
+// use trotlp
+//
+// fn main() [io]
+//     println(trotlp.scope("my-http-client", "1.2.0").version)
+// ```
+pub fn scope(name: Str, version: Str) -> TrScope []
+    todo("tracing-nv.trotlp.scope")
+
+// An exporter to this endpoint.
+//
+// ```novo
+// use trotlp
+//
+// fn main() [io]
+//     let x = trotlp.exporter("http://localhost:4318",
+//                             trotlp.resource("checkout", []))
+//     println(x.endpoint)
+// ```
+pub fn exporter(endpoint: Str, r: TrResource) -> TrOtlpExporter []
+    todo("tracing-nv.trotlp.exporter")
+
+// The same exporter with a different deadline.
+//
+// ```novo
+// use trotlp
+//
+// fn main() [io]
+//     let x = trotlp.with_timeout(
+//         trotlp.exporter("http://localhost:4318", trotlp.resource("checkout", [])),
+//         2.0)
+//     println("${x.timeout_seconds}")
+// ```
+pub fn with_timeout(x: TrOtlpExporter, seconds: Float) -> TrOtlpExporter []
+    todo("tracing-nv.trotlp.with_timeout")
+
+// The collector URL the environment names, by `std.otlp`'s own
+// convention.
+//
+// `OTLP_ENDPOINT`, defaulting to `http://localhost:4318`, and `"off"`
+// answered verbatim so a caller can check it with `is_disabled` rather
+// than comparing a URL to a word.  `[io]` because the environment is
+// `[io]` (SPEC § 5.1).
+//
+// The same variable the standard library reads, deliberately: a program
+// that used both would otherwise have two endpoints to configure and
+// would discover the second one the day its traces went missing.
+//
+// ```novo
+// use trotlp
+//
+// fn configured() -> Str [io]
+//     trotlp.endpoint_from_env()
+//
+// fn main() [io]
+//     println("the collector the environment names")
+// ```
+pub fn endpoint_from_env() -> Str [io]
+    todo("tracing-nv.trotlp.endpoint_from_env")
+
+// The service name the environment names: `OTLP_SERVICE`, defaulting to
+// `novo-app`.
+//
+// ```novo
+// use trotlp
+//
+// fn configured() -> Str [io]
+//     trotlp.service_from_env()
+//
+// fn main() [io]
+//     println("the service name the environment names")
+// ```
+pub fn service_from_env() -> Str [io]
+    todo("tracing-nv.trotlp.service_from_env")
+
+// Has the environment turned exporting off?
+//
+// `[]` — it takes the endpoint rather than reading it, so a caller that
+// read the environment once can ask this anywhere, including in a
+// `core`-shaped test of its own configuration.
+//
+// ```novo
+// use trotlp
+//
+// fn main() [io]
+//     println("${trotlp.is_disabled("off")}")
+// ```
+pub fn is_disabled(endpoint: Str) -> Bool []
+    todo("tracing-nv.trotlp.is_disabled")
+
+// POST an already-encoded document to a collector.
+//
+// `[net]`, and it is the only row in this module that reaches one.
+// Published beside the exporter so a caller with its own HTTP client —
+// one that already has the connection pool, the retries and the
+// proxy configuration a service needs — can send the bytes itself.
+//
+// ```novo
+// use trotlp
+//
+// fn ship(url: Str, body: Str) -> TrExportOutcome [net]
+//     trotlp.send(url, body, 5.0)
+//
+// fn main() [io]
+//     println("a document, posted to a collector")
+// ```
+pub fn send(endpoint: Str, document: Str, timeout_seconds: Float) -> TrExportOutcome [net]
+    todo("tracing-nv.trotlp.send")
+
+// The path a traces document is POSTed to: `/v1/traces`.
+//
+// Published because the endpoint a program configures is a BASE URL and
+// the three OTLP signals have three paths; a program that configured
+// the full path and a library that appended one produce
+// `/v1/traces/v1/traces`, which a collector answers with a 404 that
+// nobody reads.
+//
+// ```novo
+// use trotlp
+//
+// fn main() [io]
+//     println(trotlp.traces_path())
+// ```
+pub fn traces_path() -> Str []
+    todo("tracing-nv.trotlp.traces_path")

@@ -1,0 +1,276 @@
+// trsample.nv — who decides which traces are kept, and when.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A SAMPLER IS A NAMED FUNCTION IN A STRUCT, NOT A TRAIT AND NOT A
+// LAMBDA.  A trait cannot be generic over the value type here — SPEC
+// § 3.6's bounds carry an effect argument and never a type one — and a
+// lambda that becomes a value is refused at `@tier(embedded)`.  So
+// `TrSampler` holds a function-typed field, which is the arrangement
+// proptest-core-nv and matchers-nv arrived at for the same two reasons,
+// and the field is filled with a NAMED function.
+//
+// THE DECISION IS MADE ONCE, AT THE ROOT, AND CARRIED.  A sampler runs
+// when a span has no parent; a span WITH a parent inherits the parent's
+// sampled bit and does not ask.  That is not an optimisation, it is what
+// makes a trace a trace: a sampler that ran per span would keep the
+// child of a dropped parent, and a backend receiving a span whose parent
+// never arrived shows a broken tree that an operator cannot distinguish
+// from a crashed service.
+//
+// `parent_based` IS THE DEFAULT FOR EXACTLY THAT REASON, and it is the
+// one sampler a service at the edge of a trust boundary should think
+// twice about: honouring an upstream's sampled bit means an upstream
+// that sets it on everything can make this service export everything.
+// `parent_based_with_root` is the composition that keeps the tree intact
+// and still bounds a root.
+//
+// THE DECISION IS A FUNCTION OF THE TRACE ID, NOT OF A RANDOM DRAW.
+// `trace_id_ratio` hashes the trace id, so every service in a
+// distributed system that runs the same ratio makes the SAME decision
+// about the same trace, without coordinating — which is what makes a
+// ratio sampler usable at all across services.  A random draw per
+// service at ratio 0.1 over five services keeps one trace in a hundred
+// thousand, complete.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+// What a sampler decided.
+pub enum TrDecision
+    // Do not record the span at all: no attributes are computed, no
+    // events are added, nothing is exported.  The cheap answer.
+    TrDrop
+    // Record the span but do not export it.  What a backend's local
+    // views and a tail-based sampler downstream use; the sampled bit
+    // stays CLEAR, so children in other processes are not exported
+    // either.
+    TrRecordOnly
+    // Record and export.  The sampled bit is set.
+    TrRecordAndSample
+
+// A decision, with whatever the sampler wants to say about it.
+//
+// `attributes` are added to the span, which is how a ratio sampler
+// records the ratio it used — a backend doing statistics on a sampled
+// stream needs to know what it was sampled at, and reconstructing that
+// from configuration nobody kept is the usual reason the numbers are
+// wrong.
+//
+// `trace_state` replaces the context's, which is how a sampler writes
+// its own vendor entry.  The empty string leaves it alone.
+pub struct TrSamplingResult
+    decision: TrDecision
+    attributes: [TrAttr]
+    trace_state: Str
+
+// Everything a sampler is allowed to look at.
+//
+// A struct rather than seven parameters, because a sampler is written
+// by a caller and a signature that grows a parameter breaks every one
+// of them; a struct that grows a field does not.
+pub struct TrSamplingParams
+    // `None` for a root span, which is the case a sampler exists for.
+    parent: ?TrSpanContext
+    trace_id: Str
+    name: Str
+    kind: TrSpanKind
+    // The attributes known at start.  A sampler may use them — dropping
+    // health checks by `http.route` is the commonest real policy — and
+    // a sampler that needs an attribute set later cannot have it,
+    // which is why `TrRecordOnly` exists.
+    attributes: [TrAttr]
+    links: [TrLink]
+
+// A sampler: a name and the function that decides.
+//
+// The name is on the value because it goes into a startup line and into
+// the `sampler.type` resource attribute the specification defines; a
+// backend showing "which sampler produced this" from configuration
+// nobody exported is a backend guessing.
+pub struct TrSampler
+    name: Str
+    decide: fn(TrSamplingParams) -> TrSamplingResult []
+
+// Keep everything.
+//
+// The right default for development and for a service that exports
+// through a tail-based collector, and the wrong one for anything
+// whose volume is a cost.
+//
+// ```novo
+// use trsample
+//
+// fn main() [io]
+//     println(trsample.always_on().name)
+// ```
+pub fn always_on() -> TrSampler []
+    todo("tracing-nv.trsample.always_on")
+
+// Keep nothing.
+//
+// Not the same as not tracing: spans are still created and context is
+// still propagated, so a downstream service that samples on its own
+// still produces a trace with this service's span ids in it as parents.
+//
+// ```novo
+// use trsample
+//
+// fn main() [io]
+//     println(trsample.always_off().name)
+// ```
+pub fn always_off() -> TrSampler []
+    todo("tracing-nv.trsample.always_off")
+
+// Keep the fraction of traces whose id falls below a threshold.
+//
+// `ratio` is clamped to `[0.0, 1.0]`.  The decision is a function of the
+// trace id alone, so every service running this ratio agrees about
+// every trace without coordinating — which is the whole reason to use a
+// ratio rather than a coin.
+//
+// ```novo
+// use trsample
+//
+// fn main() [io]
+//     println(trsample.trace_id_ratio(0.01).name)
+// ```
+pub fn trace_id_ratio(ratio: Float) -> TrSampler []
+    todo("tracing-nv.trsample.trace_id_ratio")
+
+// Honour the parent's sampled bit, and keep every root.
+//
+// The specification's default, and the one that keeps a trace whole.
+//
+// ```novo
+// use trsample
+//
+// fn main() [io]
+//     println(trsample.parent_based().name)
+// ```
+pub fn parent_based() -> TrSampler []
+    todo("tracing-nv.trsample.parent_based")
+
+// Honour the parent's sampled bit, and ask this sampler about a root.
+//
+// The composition a service actually runs: a request that arrives with
+// a decision keeps it, and a request that starts here is bounded.
+//
+// ```novo
+// use trsample
+//
+// fn main() [io]
+//     let s = trsample.parent_based_with_root(trsample.trace_id_ratio(0.01))
+//     println(s.name)
+// ```
+pub fn parent_based_with_root(root: TrSampler) -> TrSampler []
+    todo("tracing-nv.trsample.parent_based_with_root")
+
+// A sampler that drops spans whose name is in a list, and defers to
+// another for everything else.
+//
+// The policy every service writes by hand: a health check and a metrics
+// scrape are two spans per second per replica, they are identical, and
+// they are the majority of a quiet service's trace volume.  Published
+// because a caller writing it themselves has to write a named function,
+// and a named function that closes over a list cannot be written.
+//
+// ```novo
+// use trsample
+//
+// fn main() [io]
+//     let s = trsample.dropping_names(["GET /healthz"], trsample.parent_based())
+//     println(s.name)
+// ```
+pub fn dropping_names(names: [Str], rest: TrSampler) -> TrSampler []
+    todo("tracing-nv.trsample.dropping_names")
+
+// A sampler from a name and a function the caller wrote.
+//
+// The escape hatch, and the shape a caller's own policy takes: a named
+// `fn(TrSamplingParams) -> TrSamplingResult []` and a name for the
+// startup line.
+//
+// ```novo
+// use trsample
+//
+// fn keep_writes(p: TrSamplingParams) -> TrSamplingResult
+//     trsample.result(TrRecordAndSample, [], "")
+//
+// fn main() [io]
+//     println(trsample.sampler("writes-only", keep_writes).name)
+// ```
+pub fn sampler(name: Str, decide: fn(TrSamplingParams) -> TrSamplingResult []) -> TrSampler []
+    todo("tracing-nv.trsample.sampler")
+
+// Run a sampler.
+//
+// The one call `trid.start_span` makes.
+//
+// ```novo
+// use trsample
+//
+// fn ask(s: TrSampler, p: TrSamplingParams) -> TrSamplingResult
+//     trsample.decide(s, p)
+//
+// fn main() [io]
+//     println("a sampling decision")
+// ```
+pub fn decide(s: TrSampler, p: TrSamplingParams) -> TrSamplingResult []
+    todo("tracing-nv.trsample.decide")
+
+// A result.
+//
+// ```novo
+// use trsample
+//
+// fn main() [io]
+//     println("${trsample.result(TrDrop, [], "").decision == TrDrop}")
+// ```
+pub fn result(decision: TrDecision, attributes: [TrAttr], trace_state: Str) -> TrSamplingResult []
+    todo("tracing-nv.trsample.result")
+
+// The parameters a root span presents to a sampler.
+//
+// ```novo
+// use trsample
+//
+// fn main() [io]
+//     let p = trsample.params(None, "4bf92f3577b34da6a3ce929d0e0e4736",
+//                             "GET /users", TrServer, [], [])
+//     println(p.name)
+// ```
+pub fn params(parent: ?TrSpanContext, trace_id: Str, name: Str, kind: TrSpanKind,
+              attributes: [TrAttr], links: [TrLink]) -> TrSamplingParams []
+    todo("tracing-nv.trsample.params")
+
+// Would a span with this decision be exported?
+//
+// `TrRecordAndSample` only.  A predicate rather than a comparison,
+// because `TrRecordOnly` is the arm every reimplementation of
+// `decision != TrDrop` gets wrong, and the symptom is a collector
+// receiving spans a tail sampler was supposed to decide about.
+//
+// ```novo
+// use trsample
+//
+// fn main() [io]
+//     println("${trsample.is_exported(TrRecordOnly)}")
+// ```
+pub fn is_exported(d: TrDecision) -> Bool []
+    todo("tracing-nv.trsample.is_exported")
+
+// Would a span with this decision be built at all?
+//
+// `TrDrop` is the cheap answer: a caller that asks this before
+// computing its attributes pays nothing for a dropped span, which is the
+// difference between a ratio sampler that saves money and one that only
+// saves network.
+//
+// ```novo
+// use trsample
+//
+// fn main() [io]
+//     println("${trsample.is_recorded(TrRecordOnly)}")
+// ```
+pub fn is_recorded(d: TrDecision) -> Bool []
+    todo("tracing-nv.trsample.is_recorded")

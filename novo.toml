@@ -1,0 +1,64 @@
+[package]
+name        = "tracing-nv"
+license     = "Apache-2.0"
+version     = "0.0.1"
+description = "OpenTelemetry tracing as values: a span with attributes, events, links and a status; a parent/child context the caller threads rather than a thread-local; W3C traceparent and tracestate as a pure codec; samplers as named functions whose decision is made once and carried in the sampled flag; and a batch exporter contract with the OTLP/JSON encoding as the shipped one.  Interface only — every body is a todo()."
+
+# `license` sits immediately after the name, before any value that could
+# contain a square bracket.  The publish reads it with a pattern that
+# stops at the first `[`, so a description naming an effect row or an
+# effect-parameterised trait hides it and the release records no licence
+# at all — silently.  The order is the only thing that keeps the facet
+# right until that is fixed.
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and five of the eight modules declare NOTHING.  The span, the
+# context, the W3C codec, the samplers and the OTLP encoding are all
+# `[]` — a trace is arithmetic over values the caller already holds, and
+# that is what lets a test assert on the exact bytes an exporter would
+# send with no collector in the room.  What performs is three rows'
+# worth: `trid` reads the clock (`[time]`) and the random source
+# (`[rand]`), `trotlp.send` reaches a collector (`[net]`), and
+# everything generic over `TracingExporter[e]` costs what the caller's
+# own exporter costs.
+layer       = "host"
+
+category    = "tooling"
+
+tags        = ["tracing", "opentelemetry", "otlp", "spans", "traceparent", "observability"]
+repository  = "https://github.com/novolang/tracing-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Spans, context and exporters"
+
+[dependencies]
+# The log record a span carries its trace id into.
+#
+# A PATH while the two are developed together.  The coordinator converts
+# this to `logging-nv = "^0.0.1"` before publish — a path dependency is
+# refused by `novo pkg publish`, `--dry-run` included, because the
+# tarball would carry the path and send every consumer to a directory
+# that is not on their machine.
+#
+# WHY THE DEPENDENCY EXISTS AT ALL.  `trlog.with_trace` puts the trace
+# id, the span id and the sampled flag into an `LgRecord`, which is the
+# one thing that makes a log line and a span findable from each other —
+# and it is the reason anybody runs both.  The type has to cross for
+# that to be checkable rather than described.
+#
+# What it costs: logging-nv's own closure, which today is ansi-nv plus
+# the five packages its device bridge brings.  That is a real price on a
+# service that wanted spans and no device, and it is the second argument
+# for splitting logging-nv's `core` half out.
+logging-nv = "^0.0.1"

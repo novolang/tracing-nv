@@ -1,0 +1,303 @@
+// trprop.nv — W3C `traceparent` and `tracestate`, as a codec.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A MALFORMED HEADER IS NOT AN ERROR, AND THAT IS THE LOAD-BEARING
+// DECISION IN THIS MODULE.  W3C Trace Context § 3.2.2.3 is explicit: a
+// receiver that cannot parse `traceparent` MUST restart the trace — mint
+// a new trace id and treat the request as a root — and MUST NOT reject
+// the request.  So `extract` answers a `TrPropagation` with a reason,
+// never a `Result`, because a `Result` at this call site invites `?` and
+// `?` at the edge of a service turns a header a middlebox mangled into a
+// 500 the client cannot fix.
+//
+// The reason is carried rather than discarded, because "we are getting
+// two hundred unparseable traceparents an hour" is a fact an operator
+// needs and a silent restart hides.
+//
+// TRACESTATE IS TEXT AND STAYS TEXT.  The header's ordering rule IS its
+// semantics: the vendor that most recently wrote is first, and a caller
+// mutating its own entry moves it to the front and leaves the rest in
+// order.  A library that parsed the header into a list and serialised it
+// back would get that right by accident until the day somebody sorted
+// the list.  `state_set` does the one mutation the specification
+// defines, on the text, and everything else is carried through
+// unchanged.
+//
+// VERSION 00 IS THE ONLY ONE WRITTEN, AND A HIGHER ONE IS READ.  The
+// specification's forward-compatibility rule says a receiver seeing a
+// version it does not know parses the first four fields it does know and
+// ignores the rest — so `extract` accepts `01-…` and reports
+// `TrPropFutureVersion`, which is information rather than a failure.
+// `ff` is the one reserved value and is invalid.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+// What came out of a header.
+//
+// The context is always usable: on a failure it is
+// `trctx.invalid_context()`, which is what tells the caller to start a
+// new trace.
+pub struct TrPropagation
+    context: TrSpanContext
+    // `TrPropOk` when the header parsed.
+    reason: TrPropReason
+    // Whether the caller should mint a new trace id — true for every
+    // reason but `TrPropOk`.  A field rather than a comparison, because
+    // a future reason that is recoverable would otherwise need every
+    // caller's `match` edited.
+    restart: Bool
+
+// Why a header did not yield a context, or that it did.
+//
+// Every arm is a real thing that arrives at a public endpoint, and they
+// are separate because an operator counting them learns different
+// things from each: a missing header is an uninstrumented caller, an
+// all-zero id is a caller whose own tracing is broken, and a bad length
+// is usually a proxy truncating a value.
+pub enum TrPropReason
+    TrPropOk
+    // No `traceparent` header at all: this request starts a trace.
+    TrPropAbsent
+    // The version field is `ff`, which the specification reserves.
+    TrPropReservedVersion
+    // A version this package does not know, parsed as far as it could
+    // be.  NOT a failure: the first four fields were read and the
+    // context is usable.
+    TrPropFutureVersion(version: Str)
+    // The wrong number of hyphen-separated fields.
+    TrPropBadShape(found: Int)
+    // A field that is not lowercase hex, or is the wrong length.
+    // `field` names which: `"version"`, `"trace-id"`, `"span-id"`,
+    // `"trace-flags"`.
+    TrPropBadField(field: Str)
+    // A well-formed header whose trace id or span id is all zeroes —
+    // the specification's invalid value, and a caller whose own tracing
+    // is misconfigured rather than a transport fault.
+    TrPropZeroId(field: Str)
+
+// A context out of a `traceparent` and a `tracestate`.
+//
+// `tracestate` may be the empty string; it is never a reason to fail,
+// because the specification says an unparseable `tracestate` is dropped
+// and the `traceparent` is still honoured.
+//
+// ```novo
+// use trprop
+//
+// fn from_headers(tp: Str, ts: Str) -> TrPropagation
+//     trprop.extract(tp, ts)
+//
+// fn main() [io]
+//     println("a context, off the wire")
+// ```
+pub fn extract(traceparent: Str, tracestate: Str) -> TrPropagation []
+    todo("tracing-nv.trprop.extract")
+
+// The `traceparent` header for this context.
+//
+// Always version `00`, always lowercase, always 55 characters.  A
+// context that is not valid produces the all-zero header rather than an
+// empty string, because a downstream service that receives no header at
+// all and one that receives an invalid one behave differently and the
+// caller should be able to choose which it says.
+//
+// ```novo
+// use trprop
+//
+// fn header(c: TrSpanContext) -> Str
+//     trprop.inject_traceparent(c)
+//
+// fn main() [io]
+//     println("the traceparent a client sends")
+// ```
+pub fn inject_traceparent(c: TrSpanContext) -> Str []
+    todo("tracing-nv.trprop.inject_traceparent")
+
+// The `tracestate` header for this context.
+//
+// The context's own `trace_state`, unchanged.  A separate call from
+// `inject_traceparent` because a caller with no `tracestate` must omit
+// the header rather than send an empty one, and only the caller knows
+// how its transport spells "omit".
+//
+// ```novo
+// use trprop
+//
+// fn header(c: TrSpanContext) -> Str
+//     trprop.inject_tracestate(c)
+//
+// fn main() [io]
+//     println("the tracestate a client sends")
+// ```
+pub fn inject_tracestate(c: TrSpanContext) -> Str []
+    todo("tracing-nv.trprop.inject_tracestate")
+
+// A `tracestate` with this vendor's entry set, moved to the front.
+//
+// The one mutation the specification defines, done on the text.  An
+// existing entry under the same key is removed first, so a vendor
+// appears once; the list is truncated to the specification's 32 entries
+// and 512 characters, dropping from the RIGHT, which is the end the
+// specification says is least recently written.
+//
+// ```novo
+// use trprop
+//
+// fn mine(ts: Str) -> Str
+//     trprop.state_set(ts, "acme", "p:8")
+//
+// fn main() [io]
+//     println("a tracestate, with this vendor first")
+// ```
+pub fn state_set(tracestate: Str, key: Str, value: Str) -> Str []
+    todo("tracing-nv.trprop.state_set")
+
+// The value this vendor wrote into a `tracestate`, or `None`.
+//
+// ```novo
+// use trprop
+//
+// fn mine(ts: Str) -> ?Str
+//     trprop.state_get(ts, "acme")
+//
+// fn main() [io]
+//     println("a vendor's own tracestate entry")
+// ```
+pub fn state_get(tracestate: Str, key: Str) -> ?Str []
+    todo("tracing-nv.trprop.state_get")
+
+// A `tracestate` with this vendor's entry removed.
+//
+// ```novo
+// use trprop
+//
+// fn drop_mine(ts: Str) -> Str
+//     trprop.state_remove(ts, "acme")
+//
+// fn main() [io]
+//     println("a tracestate, with one vendor dropped")
+// ```
+pub fn state_remove(tracestate: Str, key: Str) -> Str []
+    todo("tracing-nv.trprop.state_remove")
+
+// Is this `tracestate` one the specification allows?
+//
+// Published as a predicate rather than enforced inside `state_set`,
+// because a header that arrived over-length is still a header this
+// service must forward, and refusing it here would make a
+// specification-violating caller upstream into an outage here.
+//
+// ```novo
+// use trprop
+//
+// fn ok(ts: Str) -> Bool
+//     trprop.state_is_valid(ts)
+//
+// fn main() [io]
+//     println("whether a tracestate is within the limits")
+// ```
+pub fn state_is_valid(tracestate: Str) -> Bool []
+    todo("tracing-nv.trprop.state_is_valid")
+
+// The `baggage` header for this context's baggage entries.
+//
+// The empty string when there are none, which is the caller's cue to
+// omit the header.
+//
+// ```novo
+// use trprop
+//
+// fn header(c: TrContext) -> Str
+//     trprop.inject_baggage(c)
+//
+// fn main() [io]
+//     println("the baggage a client sends")
+// ```
+pub fn inject_baggage(c: TrContext) -> Str []
+    todo("tracing-nv.trprop.inject_baggage")
+
+// The context with the entries in a `baggage` header added to it.
+//
+// A malformed entry is SKIPPED and the rest are kept, for the same
+// reason a malformed `traceparent` restarts rather than refuses: one
+// bad entry from one middlebox must not cost a service the tenant id it
+// needs.  `baggage_dropped` is how a caller finds out.
+//
+// ```novo
+// use trprop
+//
+// fn take(c: TrContext, h: Str) -> TrContext
+//     trprop.extract_baggage(c, h)
+//
+// fn main() [io]
+//     println("a context, with baggage off the wire")
+// ```
+pub fn extract_baggage(c: TrContext, header: Str) -> TrContext []
+    todo("tracing-nv.trprop.extract_baggage")
+
+// How many entries in this `baggage` header would be skipped.
+//
+// ```novo
+// use trprop
+//
+// fn lost(h: Str) -> Int
+//     trprop.baggage_dropped(h)
+//
+// fn main() [io]
+//     println("the baggage entries that would not parse")
+// ```
+pub fn baggage_dropped(header: Str) -> Int []
+    todo("tracing-nv.trprop.baggage_dropped")
+
+// The header name `traceparent`.
+//
+// The three header names are published as functions rather than left to
+// every caller's string literal, because they are lowercase by
+// specification and an HTTP client that sent `TraceParent` is correct
+// over HTTP/1.1 and refused over HTTP/2.
+//
+// ```novo
+// use trprop
+//
+// fn main() [io]
+//     println(trprop.traceparent_header())
+// ```
+pub fn traceparent_header() -> Str []
+    todo("tracing-nv.trprop.traceparent_header")
+
+// The header name `tracestate`.
+//
+// ```novo
+// use trprop
+//
+// fn main() [io]
+//     println(trprop.tracestate_header())
+// ```
+pub fn tracestate_header() -> Str []
+    todo("tracing-nv.trprop.tracestate_header")
+
+// The header name `baggage`.
+//
+// ```novo
+// use trprop
+//
+// fn main() [io]
+//     println(trprop.baggage_header())
+// ```
+pub fn baggage_header() -> Str []
+    todo("tracing-nv.trprop.baggage_header")
+
+// Why a propagation answered what it did, as one line for an operator.
+//
+// ```novo
+// use trprop
+//
+// fn why(p: TrPropagation) -> Str
+//     trprop.reason_message(p.reason)
+//
+// fn main() [io]
+//     println("why a trace restarted")
+// ```
+pub fn reason_message(r: TrPropReason) -> Str []
+    todo("tracing-nv.trprop.reason_message")

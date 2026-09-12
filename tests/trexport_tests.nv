@@ -1,0 +1,203 @@
+// trexport_tests.nv — the batch, and the trait the pipeline is written
+// against.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: tracing-nv.trexport.<fn>`.
+//
+// THE ASSERTION THE COMPILER MAKES is `ship` below: a pipeline declared
+// `[mutate]` over the in-memory exporter, whose impl supplies exactly
+// `[mutate]`.  If the effect parameter did not do what this package
+// claims, that function would not compile, and no `test.assert` could
+// say so.  The rest of the file is the batch arithmetic, which is where
+// a batch processor loses spans: the queue bound that drops silently and
+// the delay bound that never fires on a quiet service.
+
+use std.test
+use std.list
+use trctx
+use trexport
+use trspan
+
+fn flags_of(sampled: Bool) -> Int
+    if sampled
+        1
+    else
+        0
+
+fn a_span(sampled: Bool) -> TrSpan
+    trspan.finish(
+        trspan.start("GET /users", TrServer,
+                     trctx.span_context("4bf92f3577b34da6a3ce929d0e0e4736",
+                                        "00f067aa0ba902b7",
+                                        flags_of(sampled), "", false),
+                     None, 1757548800.0),
+        1757548800.5)
+
+// A whole export pipeline, charged exactly what the in-memory exporter
+// costs and nothing more.
+fn ship(b: TrBatch, x: TrMemoryExporter) -> (TrExportOutcome, TrBatch) [mutate]
+    trexport.flush_into(b, x)
+
+@test
+fn test_the_defaults_are_the_specifications() [io]
+    let l = trexport.default_limits()
+
+    test.case("512 spans")
+    test.assert(l.max_batch == 512)
+
+    test.case("five seconds")
+    test.assert(l.max_delay_seconds == 5.0)
+
+    test.case("and a queue of 2048")
+    test.assert(l.max_queue == 2048)
+
+@test
+fn test_a_batch_fills_and_then_is_due() [io]
+    var b = trexport.batch(trexport.limits(2, 5.0, 16))
+    b = trexport.push(b, a_span(true), 1757548800.0)
+
+    test.case("one span is not a full batch")
+    test.assert(trexport.should_flush(b, 1757548800.0) == false)
+
+    b = trexport.push(b, a_span(true), 1757548800.1)
+
+    test.case("two is, because the bound is two")
+    test.assert(trexport.should_flush(b, 1757548800.1))
+
+@test
+fn test_a_quiet_service_sends_on_the_delay_rather_than_never() [io]
+    var b = trexport.batch(trexport.limits(512, 5.0, 2048))
+    b = trexport.push(b, a_span(true), 1757548800.0)
+
+    test.case("one span in a batch of 512 is not full")
+    test.assert(trexport.should_flush(b, 1757548800.0) == false)
+
+    test.case("and five seconds later it is due anyway, with no sleep in this test")
+    test.assert(trexport.should_flush(b, 1757548805.0))
+
+@test
+fn test_an_unsampled_span_is_not_queued_and_is_not_counted_as_dropped() [io]
+    var b = trexport.batch(trexport.default_limits())
+    b = trexport.push(b, a_span(false), 1757548800.0)
+
+    test.case("nothing is queued, because it was never meant to travel")
+    test.assert(list.len(b.spans) == 0)
+
+    test.case("and nothing is counted as lost, which would read as a failure in a dashboard")
+    test.assert(b.dropped == 0)
+
+@test
+fn test_a_full_queue_drops_and_counts() [io]
+    var b = trexport.batch(trexport.limits(512, 5.0, 1))
+    b = trexport.push(b, a_span(true), 1757548800.0)
+    b = trexport.push(b, a_span(true), 1757548800.1)
+
+    test.case("the queue holds its bound")
+    test.assert(list.len(b.spans) == 1)
+
+    test.case("and the loss is counted rather than silent")
+    test.assert(b.dropped == 1)
+
+@test
+fn test_draining_answers_the_spans_and_the_emptied_batch_together() [io]
+    var b = trexport.batch(trexport.default_limits())
+    b = trexport.push(b, a_span(true), 1757548800.0)
+
+    let (spans, empty) = trexport.drain(b)
+
+    test.case("the spans come out")
+    test.assert(list.len(spans) == 1)
+
+    test.case("and the batch that comes back is empty, in one call")
+    test.assert(list.len(empty.spans) == 0)
+
+    test.case("with its limits intact")
+    test.assert(empty.limits.max_batch == 512)
+
+@test
+fn test_an_outcome_is_not_a_result_because_a_partial_send_has_two_numbers() [io]
+    let partial = TrExportOutcome { sent: 400, dropped: 100,
+                                    fault: Some(TrExportRefused(429, "slow down")) }
+
+    test.case("what went")
+    test.assert(partial.sent == 400)
+
+    test.case("what did not")
+    test.assert(partial.dropped == 100)
+
+    test.case("and a partial send is not clean, even though something went")
+    test.assert(trexport.outcome_is_clean(partial) == false)
+
+@test
+fn test_retrying_the_wrong_fault_is_how_a_collector_falls_over() [io]
+    test.case("unreachable is worth trying again")
+    test.assert(trexport.is_retryable(TrExportUnreachable("connection refused")))
+
+    test.case("back-pressure is worth trying again")
+    test.assert(trexport.is_retryable(TrExportRefused(429, "slow down")))
+
+    test.case("a 400 is NOT — retrying a broken encoder forever is the outage")
+    test.assert(trexport.is_retryable(TrExportRefused(400, "malformed")) == false)
+
+    test.case("nor is a closed exporter")
+    test.assert(trexport.is_retryable(TrExportClosed) == false)
+
+    test.case("nor is a batch that was too large, which wants splitting rather than repeating")
+    test.assert(trexport.is_retryable(TrExportTooLarge(900, 512)) == false)
+
+@test
+fn test_a_fault_reads_as_one_line() [io]
+    test.case("a refusal names the status, because a 400 and a 429 lead opposite ways")
+    test.assert(TrExportRefused(429, "slow down").message() != "")
+
+    test.case("and two faults do not read the same")
+    test.assert(TrExportClosed.message() != TrExportUnreachable("no route").message())
+
+@test
+fn test_a_pipeline_over_the_in_memory_exporter_costs_only_mutate() [io]
+    var b = trexport.batch(trexport.default_limits())
+    b = trexport.push(b, a_span(true), 1757548800.0)
+
+    test.case("the whole export, charged what the exporter costs and nothing more")
+    let (outcome, emptied) = ship(b, trexport.memory_exporter(0, 1024))
+    test.assert(outcome.sent == 1)
+    test.assert(list.len(emptied.spans) == 0)
+
+@test
+fn test_flush_if_due_leaves_a_batch_that_is_not_due_alone() [io]
+    var b = trexport.batch(trexport.limits(512, 5.0, 2048))
+    b = trexport.push(b, a_span(true), 1757548800.0)
+
+    test.case("nothing is sent before the bound")
+    let (o, kept) = trexport.flush_if_due(b, trexport.memory_exporter(0, 1024), 1757548800.1)
+    test.assert(o.sent == 0)
+
+    test.case("and the span is still queued, so a loop needs no branch of its own")
+    test.assert(list.len(kept.spans) == 1)
+
+@test
+fn test_a_zero_outcome_is_what_an_idle_loop_answers() [io]
+    let o = trexport.no_outcome()
+
+    test.case("nothing sent, nothing lost, nothing wrong")
+    test.assert(o.sent == 0)
+    test.assert(o.dropped == 0)
+    test.assert(o.fault == None)
+
+    test.case("and it is not clean, because clean means something got through")
+    test.assert(trexport.outcome_is_clean(o) == false)
+
+@test
+fn test_the_in_memory_exporter_hands_a_test_what_it_received() [io]
+    let x = trexport.memory_exporter(0, 1024)
+
+    test.case("the cap it was built with")
+    test.assert(x.cap == 1024)
+
+    test.case("and what is in the slot, which is what an assertion is written against")
+    test.assert(list.len(seen(x)) == 0)
+
+// Reading the slot is `[mutate]`, which is the honest row for reaching
+// into state the exporter shares.
+fn seen(x: TrMemoryExporter) -> [TrSpan] [mutate]
+    trexport.exported_spans(x)

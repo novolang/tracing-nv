@@ -1,0 +1,150 @@
+// trspan_tests.nv — a span as a value, and the states it can be in.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: tracing-nv.trspan.<fn>`.
+//
+// THE ASSERTION THIS SUITE EXISTS FOR is `is_finished`.  A span nobody
+// ended is the commonest tracing bug in production and it shows up as a
+// trace that is simply missing — no error, no log line, nothing.  With a
+// span as a value it is a predicate, so it is a test here rather than an
+// outage there.
+
+use std.test
+use std.list
+use trctx
+use trspan
+
+fn a_context() -> TrSpanContext
+    trctx.span_context("4bf92f3577b34da6a3ce929d0e0e4736",
+                       "00f067aa0ba902b7", 1, "", false)
+
+fn a_span() -> TrSpan
+    trspan.start("GET /users", TrServer, a_context(), None, 1757548800.0)
+
+@test
+fn test_a_started_span_is_not_finished() [io]
+    let s = a_span()
+
+    test.case("the name and kind are what was asked for")
+    test.assert(s.name == "GET /users")
+    test.assert(s.kind == TrServer)
+
+    test.case("it has no end, which is the state a leaked span is in")
+    test.assert(trspan.is_finished(s) == false)
+    test.assert(s.end_unix == 0.0)
+
+    test.case("and no duration to report")
+    test.assert(trspan.duration_seconds(s) == 0.0)
+
+@test
+fn test_finishing_a_span_gives_it_a_duration() [io]
+    let done = trspan.finish(a_span(), 1757548800.5)
+
+    test.case("it is finished")
+    test.assert(trspan.is_finished(done))
+
+    test.case("and the duration is the difference the caller's two instants make")
+    test.assert(done.end_unix == 1757548800.5)
+    test.assert(trspan.duration_seconds(done) == 0.5)
+
+@test
+fn test_finishing_twice_is_not_a_failure() [io]
+    let once = trspan.finish(a_span(), 1757548800.5)
+    let twice = trspan.finish(once, 1757548801.0)
+
+    test.case("the second end does not move the first, so a double end is idempotent")
+    test.assert(twice.end_unix == 1757548800.5)
+
+    test.case("and nothing had to be a Result on the exit of an instrumented function")
+    test.assert(trspan.is_finished(twice))
+
+@test
+fn test_attributes_keep_their_type() [io]
+    let s = trspan.with_attrs(a_span(),
+                              [trspan.attr_int("http.status_code", 200),
+                               trspan.attr_str("http.method", "GET"),
+                               trspan.attr_bool("http.request.resend", false),
+                               trspan.attr_float("db.duration_ms", 12.5)])
+
+    test.case("all four are on the span")
+    test.assert(list.len(s.attributes) == 4)
+
+    test.case("and the integer is an integer, which is what a backend aggregates on")
+    match trspan.attr_of(s, "http.status_code")
+        Some(TrvInt(v)) => test.assert(v == 200)
+        Some(_)         => test.assert(false)
+        None            => test.assert(false)
+
+@test
+fn test_a_duplicate_attribute_key_is_reported_and_not_resolved() [io]
+    let s = trspan.with_attrs(a_span(),
+                              [trspan.attr_str("http.method", "GET"),
+                               trspan.attr_str("http.method", "POST")])
+
+    test.case("both are kept, because the specification defines no rule a library may impose")
+    test.assert(list.len(s.attributes) == 2)
+
+    test.case("and the clash is reported, which is how a test catches the instrumentation")
+    test.assert(list.len(trspan.duplicate_keys(s)) == 1)
+
+    test.case("a span with no clash reports nothing")
+    test.assert(list.len(trspan.duplicate_keys(a_span())) == 0)
+
+@test
+fn test_an_event_records_an_instant_rather_than_a_duration() [io]
+    let s = trspan.with_event(a_span(),
+                              trspan.event("cache.miss", 1757548800.2, []))
+
+    test.case("the event is on the span")
+    test.assert(list.len(s.events) == 1)
+
+    test.case("and the span is still open, because an event does not end anything")
+    test.assert(trspan.is_finished(s) == false)
+
+@test
+fn test_an_exception_is_recorded_where_a_backend_looks_for_it() [io]
+    let s = trspan.record_exception(a_span(), "TimeoutError",
+                                    "upstream timed out", "", 1757548800.4)
+
+    test.case("it is an event, under the name the specification fixes")
+    test.assert(list.len(s.events) == 1)
+
+    test.case("and it does NOT set the status, because a caught exception is not a failure")
+    test.assert(s.status.code == TrUnset)
+
+@test
+fn test_the_three_statuses_are_three_different_claims() [io]
+    test.case("unset is the default: nobody said")
+    test.assert(a_span().status.code == TrUnset)
+
+    test.case("ok means somebody looked, which only an application says")
+    test.assert(trspan.with_status(a_span(), trspan.ok_status()).status.code == TrOk)
+
+    test.case("and an error carries the description a backend shows")
+    let failed = trspan.with_status(a_span(), trspan.error_status("upstream timed out"))
+    test.assert(failed.status.description == "upstream timed out")
+
+@test
+fn test_a_link_is_not_a_parent() [io]
+    let s = trspan.with_link(a_span(), trspan.link(a_context(), []))
+
+    test.case("the link is recorded")
+    test.assert(list.len(s.links) == 1)
+
+    test.case("and the span's parent is untouched, which is the whole difference")
+    test.assert(s.parent == None)
+
+@test
+fn test_a_kind_names_itself_for_the_encoding() [io]
+    test.case("the five kinds have five names")
+    test.assert(trspan.kind_name(TrServer) != trspan.kind_name(TrClient))
+    test.assert(trspan.kind_name(TrInternal) != trspan.kind_name(TrProducer))
+    test.assert(trspan.kind_name(TrConsumer) != "")
+
+@test
+fn test_a_span_starts_unset_and_says_so() [io]
+    test.case("unset is what a span carries until somebody looks")
+    test.assert(trspan.unset_status().code == TrUnset)
+
+    test.case("and it has no description, because only an error does")
+    test.assert(trspan.unset_status().description == "")

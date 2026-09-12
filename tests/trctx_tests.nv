@@ -1,0 +1,122 @@
+// trctx_tests.nv — the context a caller threads, and the flags byte.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: tracing-nv.trctx.<fn>`.
+//
+// THE ASSERTION WORTH THE FILE is that `set_sampled` leaves the other
+// seven flag bits alone.  Every reimplementation of `flags == 1` and
+// `flags = 1` is correct today and wrong the first time a middlebox sets
+// a reserved bit, and the symptom is a flag that silently stops
+// travelling — nothing fails, a vendor's feature just does not work.
+
+use std.test
+use std.list
+use std.str
+use trctx
+
+fn sampled_context() -> TrSpanContext
+    trctx.span_context("4bf92f3577b34da6a3ce929d0e0e4736",
+                       "00f067aa0ba902b7", 1, "", false)
+
+@test
+fn test_an_empty_context_has_nothing_active() [io]
+    let c = trctx.empty()
+
+    test.case("no active span, which is where a program starts")
+    test.assert(c.active == None)
+    test.assert(trctx.active_of(c) == None)
+
+@test
+fn test_entering_a_span_makes_it_active() [io]
+    let c = trctx.with_active(trctx.empty(), sampled_context())
+
+    test.case("the span is active")
+    match trctx.active_of(c)
+        Some(s) => test.assert(s.span_id == "00f067aa0ba902b7")
+        None    => test.assert(false)
+
+    test.case("and the context it came from is unchanged, because it is a value")
+    test.assert(trctx.empty().active == None)
+
+@test
+fn test_a_valid_context_is_the_right_shape_and_not_all_zeroes() [io]
+    test.case("a well-formed context is valid")
+    test.assert(trctx.is_valid(sampled_context()))
+
+    test.case("the invalid context the specification defines is not")
+    test.assert(trctx.is_valid(trctx.invalid_context()) == false)
+
+    test.case("an all-zero trace id is not, even with a good span id")
+    test.assert(trctx.is_valid(trctx.span_context(trctx.invalid_trace_id(),
+                                                  "00f067aa0ba902b7", 1, "", false)) == false)
+
+    test.case("an all-zero span id is not either")
+    test.assert(trctx.is_valid(trctx.span_context("4bf92f3577b34da6a3ce929d0e0e4736",
+                                                  trctx.invalid_span_id(), 1, "", false)) == false)
+
+    test.case("and a trace id of the wrong length is not, whatever it contains")
+    test.assert(trctx.is_valid(trctx.span_context("4bf92f", "00f067aa0ba902b7",
+                                                  1, "", false)) == false)
+
+@test
+fn test_the_invalid_ids_are_the_lengths_the_specification_gives_them() [io]
+    test.case("a trace id is 32 characters")
+    test.assert(str.len(trctx.invalid_trace_id()) == 32)
+
+    test.case("and a span id is 16")
+    test.assert(str.len(trctx.invalid_span_id()) == 16)
+
+@test
+fn test_the_sampled_bit_is_bit_zero_and_the_rest_are_left_alone() [io]
+    test.case("bit 0 set means sampled")
+    test.assert(trctx.is_sampled(sampled_context()))
+
+    test.case("bit 0 clear means not")
+    let unsampled = trctx.span_context("4bf92f3577b34da6a3ce929d0e0e4736",
+                                       "00f067aa0ba902b7", 0, "", false)
+    test.assert(trctx.is_sampled(unsampled) == false)
+
+    test.case("a reserved bit set does NOT mean sampled, which is what flags == 1 gets wrong")
+    let reserved = trctx.span_context("4bf92f3577b34da6a3ce929d0e0e4736",
+                                      "00f067aa0ba902b7", 2, "", false)
+    test.assert(trctx.is_sampled(reserved) == false)
+
+    test.case("and setting sampled keeps the reserved bit, which is what flags = 1 destroys")
+    test.assert(trctx.set_sampled(reserved, true).flags == 3)
+
+    test.case("clearing it keeps the reserved bit too")
+    test.assert(trctx.set_sampled(trctx.span_context(
+        "4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7", 3, "", false),
+        false).flags == 2)
+
+@test
+fn test_baggage_is_replaced_by_key_rather_than_appended() [io]
+    let c = trctx.with_baggage(trctx.with_baggage(trctx.empty(), "tenant", "acme", ""),
+                               "tenant", "globex", "")
+
+    test.case("the second write wins, because baggage is read back by key")
+    test.assert(trctx.baggage_of(c, "tenant") == Some("globex"))
+
+    test.case("and there is one entry rather than two")
+    test.assert(list.len(c.baggage) == 1)
+
+@test
+fn test_baggage_can_be_dropped_before_it_crosses_a_boundary() [io]
+    let c = trctx.with_baggage(trctx.empty(), "tenant", "acme", "")
+
+    test.case("it is there")
+    test.assert(trctx.baggage_of(c, "tenant") == Some("acme"))
+
+    test.case("and it can be removed, which is what a service forwarding outward needs")
+    test.assert(trctx.baggage_of(trctx.without_baggage(c, "tenant"), "tenant") == None)
+
+@test
+fn test_a_remote_context_says_so() [io]
+    let remote = trctx.span_context("4bf92f3577b34da6a3ce929d0e0e4736",
+                                    "00f067aa0ba902b7", 1, "", true)
+
+    test.case("a context off the wire is marked remote")
+    test.assert(remote.remote)
+
+    test.case("and one minted here is not, which is the root/continuation difference")
+    test.assert(sampled_context().remote == false)

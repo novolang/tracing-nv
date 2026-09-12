@@ -1,0 +1,159 @@
+// trid_tests.nv — where the effects are, and how a test gets round them.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: tracing-nv.trid.<fn>`.
+//
+// THE SEEDED TRACER IS WHAT MAKES THIS FILE POSSIBLE.  `start_span` is
+// `[rand]`, so a suite that used the real one could assert that a child
+// carries its parent's trace id and nothing about WHICH trace id.  With
+// a seed the whole trace is a fixture, the ids are predictable, and the
+// assertions are the ones that matter: a root runs the sampler, a child
+// does not, and a dropped span still propagates.
+
+use std.test
+use std.str
+use trctx
+use trid
+use trprop
+use trsample
+
+fn fixture() -> TrTracer
+    trid.seeded_tracer(trsample.always_on(), 1)
+
+fn quiet_fixture() -> TrTracer
+    trid.seeded_tracer(trsample.always_off(), 1)
+
+@test
+fn test_a_seeded_tracer_mints_ids_a_test_can_name() [io]
+    let (trace_id, span_id) = trid.seeded_ids(1, 0)
+
+    test.case("a trace id is 32 characters")
+    test.assert(str.len(trace_id) == 32)
+
+    test.case("a span id is 16")
+    test.assert(str.len(span_id) == 16)
+
+    test.case("the same seed and step give the same ids, which is what makes a fixture one")
+    let (again, _) = trid.seeded_ids(1, 0)
+    test.assert(again == trace_id)
+
+    test.case("and a different step gives different ones")
+    let (next, _) = trid.seeded_ids(1, 1)
+    test.assert(next != trace_id)
+
+@test
+fn test_a_root_span_runs_the_sampler() [io]
+    let started = trid.start_span(fixture(), trctx.empty(), "GET /users", TrServer,
+                                  [], [], 1757548800.0)
+
+    test.case("the sampler said to keep it")
+    test.assert(trid.is_recording(started))
+    test.assert(trctx.is_sampled(started.span.context))
+
+    test.case("it has no parent")
+    test.assert(started.span.parent == None)
+
+    test.case("and it is active in the context that came back")
+    match trctx.active_of(started.context)
+        Some(c) => test.assert(c.span_id == started.span.context.span_id)
+        None    => test.assert(false)
+
+@test
+fn test_a_child_inherits_its_parents_trace_and_flags() [io]
+    let root = trid.start_span(fixture(), trctx.empty(), "GET /users", TrServer,
+                               [], [], 1757548800.0)
+    let child = trid.start_span(fixture(), root.context, "SELECT", TrClient,
+                                [], [], 1757548800.1)
+
+    test.case("the same trace")
+    test.assert(child.span.context.trace_id == root.span.context.trace_id)
+
+    test.case("a different span")
+    test.assert(child.span.context.span_id != root.span.context.span_id)
+
+    test.case("and the parent is the root, which is the assertion an ambient context cannot make")
+    match child.span.parent
+        Some(p) => test.assert(p.span_id == root.span.context.span_id)
+        None    => test.assert(false)
+
+@test
+fn test_a_child_of_a_dropped_parent_is_dropped_without_asking() [io]
+    let root = trid.start_span(quiet_fixture(), trctx.empty(), "GET /users", TrServer,
+                               [], [], 1757548800.0)
+
+    test.case("the root was dropped")
+    test.assert(trid.is_recording(root) == false)
+    test.assert(trctx.is_sampled(root.span.context) == false)
+
+    test.case("a child under an always_on tracer is STILL dropped, because it inherits")
+    let child = trid.start_span(fixture(), root.context, "SELECT", TrClient,
+                                [], [], 1757548800.1)
+    test.assert(trctx.is_sampled(child.span.context) == false)
+
+@test
+fn test_a_dropped_span_still_gets_a_context_to_propagate() [io]
+    let root = trid.start_span(quiet_fixture(), trctx.empty(), "GET /users", TrServer,
+                               [], [], 1757548800.0)
+
+    test.case("it has real ids, because a downstream service needs them as its parent")
+    test.assert(trctx.is_valid(root.span.context))
+
+    test.case("and the caller is told not to spend anything on it")
+    test.assert(trid.is_recording(root) == false)
+
+@test
+fn test_continuing_a_trace_makes_the_next_span_a_child_rather_than_a_root() [io]
+    let inbound = trprop.extract(
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", "")
+    let ctx = trid.continue_trace(inbound)
+
+    test.case("the upstream span is active")
+    match trctx.active_of(ctx)
+        Some(c) => test.assert(c.trace_id == "4bf92f3577b34da6a3ce929d0e0e4736")
+        None    => test.assert(false)
+
+    test.case("so the first span here keeps the upstream trace id")
+    let s = trid.start_span(fixture(), ctx, "GET /users", TrServer, [], [], 1757548800.0)
+    test.assert(s.span.context.trace_id == "4bf92f3577b34da6a3ce929d0e0e4736")
+
+    test.case("and names the upstream span as its parent")
+    match s.span.parent
+        Some(p) => test.assert(p.span_id == "00f067aa0ba902b7")
+        None    => test.assert(false)
+
+@test
+fn test_a_restarted_propagation_makes_a_root() [io]
+    let ctx = trid.continue_trace(trprop.extract("this is not a traceparent", ""))
+
+    test.case("nothing is active, so the next span is a root and the sampler runs")
+    test.assert(trctx.active_of(ctx) == None)
+
+@test
+fn test_a_tracer_carries_the_scope_its_spans_are_attributed_to() [io]
+    test.case("the default is this package")
+    test.assert(fixture().scope.name != "")
+
+    test.case("and the sampler it was built with")
+    test.assert(fixture().sampler.name == trsample.always_on().name)
+
+// The four rows in this package that touch the machine, named here with
+// the rows they declare.  A suite cannot assert what the entropy source
+// or the clock answers, so these are compiled rather than run — and that
+// they are only four is the disclosure.
+fn fresh_trace() -> Str [rand]
+    trid.new_trace_id()
+
+fn fresh_span() -> Str [rand]
+    trid.new_span_id()
+
+fn a_root() -> TrSpanContext [rand]
+    trid.root_context()
+
+fn a_child(p: TrSpanContext) -> TrSpanContext [rand]
+    trid.child_context(p)
+
+fn stamp() -> Float [time]
+    trid.now_unix()
+
+fn a_real_tracer(s: TrSampler) -> TrTracer
+    trid.tracer_for(s, trid.tracer(s).scope)

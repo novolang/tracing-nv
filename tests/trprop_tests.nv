@@ -1,0 +1,199 @@
+// trprop_tests.nv — the W3C headers, and the rule that a bad one is not
+// an error.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: tracing-nv.trprop.<fn>`.
+//
+// EVERY MALFORMED HEADER BELOW HAS ARRIVED AT A REAL ENDPOINT.  A
+// truncating proxy, a client that built the header by hand, a middlebox
+// that upgraded the version, a service whose own tracing was
+// misconfigured and sent all zeroes.  W3C Trace Context § 3.2.2.3 says
+// every one of them restarts the trace and none of them refuses the
+// request, and that is what these cases assert.
+
+use std.test
+use std.str
+use trctx
+use trprop
+
+// The specification's own example header.
+fn good() -> Str
+    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+
+@test
+fn test_the_specifications_own_example_parses() [io]
+    let p = trprop.extract(good(), "")
+
+    test.case("it is accepted")
+    test.assert(p.reason == TrPropOk)
+    test.assert(p.restart == false)
+
+    test.case("the ids come off it")
+    test.assert(p.context.trace_id == "4bf92f3577b34da6a3ce929d0e0e4736")
+    test.assert(p.context.span_id == "00f067aa0ba902b7")
+
+    test.case("the sampled flag comes off it")
+    test.assert(trctx.is_sampled(p.context))
+
+    test.case("and it is marked remote, because it came from another process")
+    test.assert(p.context.remote)
+
+@test
+fn test_no_header_at_all_starts_a_trace_rather_than_failing() [io]
+    let p = trprop.extract("", "")
+
+    test.case("absent is its own reason, because it means an uninstrumented caller")
+    test.assert(p.reason == TrPropAbsent)
+
+    test.case("and the caller is told to start a trace")
+    test.assert(p.restart)
+
+@test
+fn test_every_malformed_header_restarts_and_none_of_them_refuses() [io]
+    test.case("the wrong number of fields")
+    let shape = trprop.extract("00-4bf92f3577b34da6a3ce929d0e0e4736-01", "")
+    test.assert(shape.restart)
+    test.assert(trctx.is_valid(shape.context) == false)
+
+    test.case("a trace id that is not hex")
+    let hex = trprop.extract("00-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-00f067aa0ba902b7-01", "")
+    test.assert(hex.restart)
+
+    test.case("a span id of the wrong length, which is what a truncating proxy produces")
+    let cut = trprop.extract("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa-01", "")
+    test.assert(cut.restart)
+
+    test.case("the reserved version ff")
+    let ff = trprop.extract("ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", "")
+    test.assert(ff.reason == TrPropReservedVersion)
+    test.assert(ff.restart)
+
+    test.case("and an all-zero trace id, which is a caller whose own tracing is broken")
+    let zero = trprop.extract("00-00000000000000000000000000000000-00f067aa0ba902b7-01", "")
+    test.assert(zero.restart)
+
+@test
+fn test_a_future_version_is_read_rather_than_refused() [io]
+    let p = trprop.extract(
+        "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-what-comes-next", "")
+
+    test.case("the four fields this package knows are read")
+    test.assert(p.context.trace_id == "4bf92f3577b34da6a3ce929d0e0e4736")
+    test.assert(trctx.is_sampled(p.context))
+
+    test.case("and it is NOT a restart, which is the forward-compatibility rule")
+    test.assert(p.restart == false)
+
+@test
+fn test_an_unparseable_tracestate_does_not_cost_the_traceparent() [io]
+    let p = trprop.extract(good(), "this is not a tracestate at all")
+
+    test.case("the traceparent is still honoured")
+    test.assert(p.reason == TrPropOk)
+    test.assert(p.context.trace_id == "4bf92f3577b34da6a3ce929d0e0e4736")
+
+@test
+fn test_injection_round_trips_and_is_always_version_00() [io]
+    let c = trctx.span_context("4bf92f3577b34da6a3ce929d0e0e4736",
+                               "00f067aa0ba902b7", 1, "", false)
+    let h = trprop.inject_traceparent(c)
+
+    test.case("55 characters, which is the only length the specification has")
+    test.assert(str.len(h) == 55)
+
+    test.case("version 00")
+    test.assert(str.starts_with(h, "00-"))
+
+    test.case("and it parses back to the same context")
+    let back = trprop.extract(h, "")
+    test.assert(back.context.trace_id == c.trace_id)
+    test.assert(back.context.span_id == c.span_id)
+    test.assert(trctx.is_sampled(back.context) == trctx.is_sampled(c))
+
+@test
+fn test_a_vendor_writing_tracestate_goes_to_the_front() [io]
+    let ts = trprop.state_set("congo=t61rcWkgMzE", "acme", "p:8")
+
+    test.case("this vendor is first, which is the ordering the specification gives meaning to")
+    test.assert(str.starts_with(ts, "acme=p:8"))
+
+    test.case("and the other vendor is still there")
+    test.assert(trprop.state_get(ts, "congo") == Some("t61rcWkgMzE"))
+
+@test
+fn test_writing_a_vendor_twice_leaves_one_entry() [io]
+    let ts = trprop.state_set(trprop.state_set("", "acme", "p:1"), "acme", "p:2")
+
+    test.case("the newer value wins")
+    test.assert(trprop.state_get(ts, "acme") == Some("p:2"))
+
+    test.case("and there is no second acme entry left behind it")
+    test.assert(str.starts_with(ts, "acme=p:2"))
+
+@test
+fn test_a_vendor_can_be_removed() [io]
+    let ts = trprop.state_remove("acme=p:8,congo=t61rcWkgMzE", "acme")
+
+    test.case("it is gone")
+    test.assert(trprop.state_get(ts, "acme") == None)
+
+    test.case("and the rest is not")
+    test.assert(trprop.state_get(ts, "congo") == Some("t61rcWkgMzE"))
+
+@test
+fn test_an_over_long_tracestate_is_reported_and_still_forwarded() [io]
+    test.case("a short one is valid")
+    test.assert(trprop.state_is_valid("acme=p:8"))
+
+    test.case("and extraction does not refuse an invalid one, because forwarding it is this service's job")
+    let p = trprop.extract(good(), "acme=p:8")
+    test.assert(p.reason == TrPropOk)
+
+@test
+fn test_baggage_survives_one_bad_entry() [io]
+    let c = trprop.extract_baggage(trctx.empty(), "tenant=acme,this-is-not-an-entry,region=eu")
+
+    test.case("the good entries are kept")
+    test.assert(trctx.baggage_of(c, "tenant") == Some("acme"))
+    test.assert(trctx.baggage_of(c, "region") == Some("eu"))
+
+    test.case("and the caller can find out that one was dropped")
+    test.assert(trprop.baggage_dropped("tenant=acme,this-is-not-an-entry,region=eu") == 1)
+
+@test
+fn test_baggage_injects_empty_when_there_is_none() [io]
+    test.case("the empty string is the caller's cue to omit the header")
+    test.assert(trprop.inject_baggage(trctx.empty()) == "")
+
+    test.case("and a context with baggage produces one")
+    test.assert(trprop.inject_baggage(
+        trctx.with_baggage(trctx.empty(), "tenant", "acme", "")) != "")
+
+@test
+fn test_the_header_names_are_lowercase() [io]
+    test.case("lowercase, because HTTP/2 refuses anything else")
+    test.assert(trprop.traceparent_header() == "traceparent")
+    test.assert(trprop.tracestate_header() == "tracestate")
+    test.assert(trprop.baggage_header() == "baggage")
+
+@test
+fn test_a_reason_reads_as_one_line_for_an_operator() [io]
+    test.case("every reason says something")
+    test.assert(trprop.reason_message(TrPropAbsent) != "")
+    test.assert(trprop.reason_message(TrPropBadShape(3)) != "")
+
+    test.case("and two reasons do not read the same, which is the point of counting them")
+    test.assert(trprop.reason_message(TrPropAbsent) != trprop.reason_message(TrPropReservedVersion))
+
+@test
+fn test_the_tracestate_header_is_injected_separately_from_the_traceparent() [io]
+    let c = trctx.span_context("4bf92f3577b34da6a3ce929d0e0e4736",
+                               "00f067aa0ba902b7", 1, "acme=p:8", false)
+
+    test.case("the context's own tracestate comes back unchanged")
+    test.assert(trprop.inject_tracestate(c) == "acme=p:8")
+
+    test.case("and a context with none answers empty, which is the cue to omit the header")
+    test.assert(trprop.inject_tracestate(
+        trctx.span_context("4bf92f3577b34da6a3ce929d0e0e4736",
+                           "00f067aa0ba902b7", 1, "", false)) == "")

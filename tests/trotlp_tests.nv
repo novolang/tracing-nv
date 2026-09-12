@@ -1,0 +1,164 @@
+// trotlp_tests.nv — the document a collector receives.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: tracing-nv.trotlp.<fn>`.
+//
+// THREE FAILURES THIS SUITE EXISTS TO CATCH, and all three produce a
+// 200 from the collector and no data in the backend.  A timestamp
+// written as a JSON number, which loses microseconds in every consumer
+// with IEEE doubles.  `SPAN_KIND_INTERNAL` written as 0, which is
+// `UNSPECIFIED`.  And the three-level `resourceSpans` / `scopeSpans` /
+// `spans` nesting written with two levels, which validates and contains
+// nothing.
+
+use std.test
+use std.str
+use trctx
+use trotlp
+use trspan
+
+fn a_span() -> TrSpan
+    trspan.finish(
+        trspan.with_attr(
+            trspan.start("GET /users", TrServer,
+                         trctx.span_context("4bf92f3577b34da6a3ce929d0e0e4736",
+                                            "00f067aa0ba902b7", 1, "", false),
+                         None, 1757548800.0),
+            trspan.attr_int("http.status_code", 200)),
+        1757548800.5)
+
+@test
+fn test_a_timestamp_is_a_string_because_it_does_not_fit_a_double() [io]
+    let n = trotlp.nanos_of(1757548800.0)
+
+    test.case("it is the nanosecond count")
+    test.assert(n == "1757548800000000000")
+
+    test.case("which is nineteen digits — past 2^53, where a JSON number stops being exact")
+    test.assert(str.len(n) == 19)
+
+@test
+fn test_the_kind_codes_are_the_protocols_and_not_the_enums_positions() [io]
+    test.case("unspecified is 0 and internal is 1, so a position-based encoder is off by one")
+    test.assert(trotlp.kind_code(TrInternal) == 1)
+
+    test.case("and the rest follow the protocol's order")
+    test.assert(trotlp.kind_code(TrServer) == 2)
+    test.assert(trotlp.kind_code(TrClient) == 3)
+    test.assert(trotlp.kind_code(TrProducer) == 4)
+    test.assert(trotlp.kind_code(TrConsumer) == 5)
+
+@test
+fn test_the_status_codes_are_the_protocols() [io]
+    test.case("unset is 0, ok is 1, error is 2")
+    test.assert(trotlp.status_code(TrUnset) == 0)
+    test.assert(trotlp.status_code(TrOk) == 1)
+    test.assert(trotlp.status_code(TrError) == 2)
+
+@test
+fn test_an_attribute_is_wrapped_in_the_object_naming_its_type() [io]
+    let a = trotlp.encode_attr(trspan.attr_int("http.status_code", 200))
+
+    test.case("the key is there")
+    test.assert(str.contains(a, "http.status_code"))
+
+    test.case("the value names its type, which is what OTLP requires")
+    test.assert(str.contains(a, "intValue"))
+
+    test.case("and the integer is a STRING, for the same 64-bit reason a timestamp is")
+    test.assert(str.contains(a, "\"200\""))
+
+@test
+fn test_a_string_attribute_names_its_own_type() [io]
+    let a = trotlp.encode_attr(trspan.attr_str("http.method", "GET"))
+
+    test.case("stringValue rather than intValue")
+    test.assert(str.contains(a, "stringValue"))
+    test.assert(str.contains(a, "GET"))
+
+@test
+fn test_the_document_has_all_three_levels_of_nesting() [io]
+    let doc = trotlp.encode(trotlp.resource("checkout", []), trotlp.this_scope(),
+                            [a_span()])
+
+    test.case("resourceSpans, which carries the service name")
+    test.assert(str.contains(doc, "resourceSpans"))
+
+    test.case("scopeSpans, which says what produced them")
+    test.assert(str.contains(doc, "scopeSpans"))
+
+    test.case("and the spans themselves")
+    test.assert(str.contains(doc, "spans"))
+
+    test.case("with the service name, without which a collector files them under unknown_service")
+    test.assert(str.contains(doc, "checkout"))
+
+@test
+fn test_a_span_carries_its_ids_and_its_times() [io]
+    let one = trotlp.encode_span(a_span())
+
+    test.case("the trace id and the span id")
+    test.assert(str.contains(one, "4bf92f3577b34da6a3ce929d0e0e4736"))
+    test.assert(str.contains(one, "00f067aa0ba902b7"))
+
+    test.case("the name")
+    test.assert(str.contains(one, "GET /users"))
+
+    test.case("and both endpoints, as nanosecond strings")
+    test.assert(str.contains(one, "1757548800000000000"))
+    test.assert(str.contains(one, "1757548800500000000"))
+
+@test
+fn test_an_empty_batch_is_still_a_document_and_not_an_error() [io]
+    let doc = trotlp.encode(trotlp.resource("checkout", []), trotlp.this_scope(), [])
+
+    test.case("a collector receiving it does nothing, which is what a caller wanted")
+    test.assert(str.contains(doc, "resourceSpans"))
+
+@test
+fn test_the_scope_says_what_produced_the_spans() [io]
+    test.case("this package names itself")
+    test.assert(trotlp.this_scope().name != "")
+    test.assert(trotlp.this_scope().version != "")
+
+    test.case("and an instrumentation library can name itself instead")
+    test.assert(trotlp.scope("my-http-client", "1.2.0").name == "my-http-client")
+
+@test
+fn test_the_endpoint_and_the_path_are_two_facts() [io]
+    test.case("the path is the protocol's")
+    test.assert(trotlp.traces_path() == "/v1/traces")
+
+    test.case("and off means off, which is std.otlp's own convention")
+    test.assert(trotlp.is_disabled("off"))
+
+    test.case("a real URL does not")
+    test.assert(trotlp.is_disabled("http://localhost:4318") == false)
+
+@test
+fn test_an_exporter_carries_its_configuration() [io]
+    let x = trotlp.exporter("http://localhost:4318", trotlp.resource("checkout", []))
+
+    test.case("the endpoint")
+    test.assert(x.endpoint == "http://localhost:4318")
+
+    test.case("the service name it reports under")
+    test.assert(x.resource.service_name == "checkout")
+
+    test.case("and a deadline, because a telemetry exporter without one makes a service slow")
+    test.assert(x.timeout_seconds > 0.0)
+
+    test.case("which a caller can change")
+    test.assert(trotlp.with_timeout(x, 2.0).timeout_seconds == 2.0)
+
+// The two rows in this module that reach the machine, named here with
+// the rows they declare.  A suite cannot assert what a collector or an
+// environment answers, so these are compiled rather than run.
+fn ship(url: Str, body: Str) -> TrExportOutcome [net]
+    trotlp.send(url, body, 5.0)
+
+fn configured() -> Str [io]
+    trotlp.endpoint_from_env()
+
+fn named() -> Str [io]
+    trotlp.service_from_env()

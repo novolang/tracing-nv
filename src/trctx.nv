@@ -1,0 +1,294 @@
+// trctx.nv — the context a caller threads, and the reason there is no
+// thread-local anywhere in this package.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THERE ARE NO THREAD-LOCALS, AND THAT IS A DECISION RATHER THAN AN
+// OMISSION.  Every mainstream tracing library keeps the current span in
+// ambient storage so that instrumentation need not thread it: Rust's
+// `tracing` has a thread-local subscriber stack, OpenTelemetry's Python
+// and Java APIs have a context manager.  Three things are wrong with
+// that here.
+//
+// It is a LIE ABOUT EFFECTS.  Reading and writing ambient storage is
+// `[mutate]`, and a library that hid it would put that row on every
+// call that starts a span — including the ones a `core`-shaped caller
+// makes, which then cannot make them at all.  A value costs nothing and
+// says so.
+//
+// It is WRONG UNDER CONCURRENCY, and every such library has an
+// escape hatch admitting it: a task moved between threads loses its
+// context, and the fix is always the same — capture the context
+// explicitly and re-enter it on the other side.  So the explicit form
+// exists in those libraries anyway, as the advanced path, and it is the
+// one that is always correct.
+//
+// And it makes a trace UNTESTABLE.  A test that asserts a child span
+// carried its parent's trace id has to set up ambient state and tear it
+// down, and two tests running in one process interfere.  Here the
+// assertion is `child.context.trace_id == parent.context.trace_id`.
+//
+// THE COST IS REAL AND IS NOT HIDDEN: an instrumented function takes a
+// `TrContext` and returns one.  That is one parameter per boundary, and
+// it is the same parameter a request handler already threads for its
+// deadline and its cancellation.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+// The identity of one span, and what travels with it.
+//
+// The four fields W3C `traceparent` carries, and nothing else — this is
+// exactly what crosses a process boundary, which is why it is a type of
+// its own rather than fields on `TrSpan`.
+//
+// The ids are TEXT in their canonical lowercase hex — 32 characters for
+// a trace and 16 for a span — rather than integers.  A 128-bit trace id
+// does not fit an `Int`, splitting it into two would make every
+// comparison two comparisons, and the hex is what every header, every
+// log line and every backend query uses anyway.
+pub struct TrSpanContext
+    // 32 lowercase hex characters.  All zeroes is the invalid id the
+    // specification defines, and `is_valid` is what checks it.
+    trace_id: Str
+    // 16 lowercase hex characters.
+    span_id: Str
+    // The `trace-flags` byte.  Bit 0 is `sampled`; the rest are
+    // reserved and are carried unchanged rather than masked, because a
+    // future flag a middlebox set must survive this process.
+    flags: Int
+    // The `tracestate` header verbatim, vendor entries and all.  Text
+    // rather than a parsed list, because the ordering rule is
+    // load-bearing and re-serialising a parse is how a vendor's entry
+    // gets moved out of first position.
+    trace_state: Str
+    // Whether this context came off the wire rather than being minted
+    // here.  What tells an exporter that a span's parent is in another
+    // process, which is the difference between a root span and a
+    // continuation.
+    remote: Bool
+
+// The context a caller threads: the active span, and the baggage.
+//
+// Two fields and no stack.  A "current span stack" is what an ambient
+// implementation needs because it has to know what to restore on exit;
+// a threaded value restores itself by going out of scope.
+pub struct TrContext
+    // `None` at the top of a program, before anything has started.
+    active: ?TrSpanContext
+    // W3C baggage: caller-defined key/value pairs that travel with the
+    // trace.  A list rather than a map, for the same reason attributes
+    // are: the specification defines no uniqueness rule.
+    baggage: [TrBaggage]
+
+// One baggage entry.
+//
+// `properties` is the semicolon-separated tail the specification allows
+// after a value, kept verbatim because nothing in this package
+// interprets it and a round trip that dropped it would break a vendor
+// that does.
+pub struct TrBaggage
+    key: Str
+    value: Str
+    properties: Str
+
+// A context with nothing active and no baggage.
+//
+// What a program starts with, and what a test starts with.
+//
+// ```novo
+// use trctx
+//
+// fn main() [io]
+//     println("${trctx.empty().active == None}")
+// ```
+pub fn empty() -> TrContext []
+    todo("tracing-nv.trctx.empty")
+
+// The context with this span active.
+//
+// The one call an instrumented function makes after starting a span:
+// everything it calls gets this context, and so becomes a child.
+//
+// ```novo
+// use trctx
+//
+// fn enter(c: TrContext, s: TrSpanContext) -> TrContext
+//     trctx.with_active(c, s)
+//
+// fn main() [io]
+//     println("a context, with a span active in it")
+// ```
+pub fn with_active(c: TrContext, s: TrSpanContext) -> TrContext []
+    todo("tracing-nv.trctx.with_active")
+
+// The active span context, or `None`.
+//
+// ```novo
+// use trctx
+//
+// fn here(c: TrContext) -> ?TrSpanContext
+//     trctx.active_of(c)
+//
+// fn main() [io]
+//     println("the span a context is inside")
+// ```
+pub fn active_of(c: TrContext) -> ?TrSpanContext []
+    todo("tracing-nv.trctx.active_of")
+
+// The context with one baggage entry added or replaced.
+//
+// Replaced, unlike attributes: baggage is a key/value store a caller
+// reads back by key, and two entries under one key make every read
+// ambiguous.  Attributes are a record of what happened and are never
+// read back by the process that wrote them.
+//
+// ```novo
+// use trctx
+//
+// fn tag(c: TrContext) -> TrContext
+//     trctx.with_baggage(c, "tenant", "acme", "")
+//
+// fn main() [io]
+//     println("a context, carrying a tenant")
+// ```
+pub fn with_baggage(c: TrContext, key: Str, value: Str, properties: Str) -> TrContext []
+    todo("tracing-nv.trctx.with_baggage")
+
+// The baggage value under this key, or `None`.
+//
+// ```novo
+// use trctx
+//
+// fn tenant(c: TrContext) -> ?Str
+//     trctx.baggage_of(c, "tenant")
+//
+// fn main() [io]
+//     println("a baggage value, looked up")
+// ```
+pub fn baggage_of(c: TrContext, key: Str) -> ?Str []
+    todo("tracing-nv.trctx.baggage_of")
+
+// The context with this baggage key removed.
+//
+// Published because baggage crosses process boundaries and a service
+// that forwards a tenant it should not have is a data leak, not
+// clutter.
+//
+// ```novo
+// use trctx
+//
+// fn strip(c: TrContext) -> TrContext
+//     trctx.without_baggage(c, "tenant")
+//
+// fn main() [io]
+//     println("a context, with one entry dropped")
+// ```
+pub fn without_baggage(c: TrContext, key: Str) -> TrContext []
+    todo("tracing-nv.trctx.without_baggage")
+
+// A span context built from its four parts.
+//
+// ```novo
+// use trctx
+//
+// fn main() [io]
+//     let c = trctx.span_context("4bf92f3577b34da6a3ce929d0e0e4736",
+//                                "00f067aa0ba902b7", 1, "", false)
+//     println(c.span_id)
+// ```
+pub fn span_context(trace_id: Str, span_id: Str, flags: Int, trace_state: Str,
+                    remote: Bool) -> TrSpanContext []
+    todo("tracing-nv.trctx.span_context")
+
+// The invalid context the specification defines: all-zero ids, no
+// flags.
+//
+// What a propagation failure answers, and what `is_valid` refuses.  It
+// exists as a value rather than as `None` because the specification
+// treats "there is a parent and it is invalid" as a distinct state from
+// "there is no parent", and an exporter reports the two differently.
+//
+// ```novo
+// use trctx
+//
+// fn main() [io]
+//     println("${trctx.is_valid(trctx.invalid_context())}")
+// ```
+pub fn invalid_context() -> TrSpanContext []
+    todo("tracing-nv.trctx.invalid_context")
+
+// Is this a context a backend will accept?
+//
+// Both ids the right length and lowercase hex, and neither all zeroes.
+// Published because the check is what a service at the edge of a trust
+// boundary runs on a header somebody else sent.
+//
+// ```novo
+// use trctx
+//
+// fn ok(c: TrSpanContext) -> Bool
+//     trctx.is_valid(c)
+//
+// fn main() [io]
+//     println("whether a context is one a backend will take")
+// ```
+pub fn is_valid(c: TrSpanContext) -> Bool []
+    todo("tracing-nv.trctx.is_valid")
+
+// Is the sampled bit set?
+//
+// A function rather than a field read, because the flag is bit 0 of a
+// byte with seven reserved neighbours, and every reimplementation of
+// `flags == 1` breaks the first time a middlebox sets one of them.
+//
+// ```novo
+// use trctx
+//
+// fn kept(c: TrSpanContext) -> Bool
+//     trctx.is_sampled(c)
+//
+// fn main() [io]
+//     println("whether a span will be exported")
+// ```
+pub fn is_sampled(c: TrSpanContext) -> Bool []
+    todo("tracing-nv.trctx.is_sampled")
+
+// The context with the sampled bit set or cleared, and every other flag
+// left alone.
+//
+// ```novo
+// use trctx
+//
+// fn keep(c: TrSpanContext) -> TrSpanContext
+//     trctx.set_sampled(c, true)
+//
+// fn main() [io]
+//     println("a context, with the sampled bit set")
+// ```
+pub fn set_sampled(c: TrSpanContext, on: Bool) -> TrSpanContext []
+    todo("tracing-nv.trctx.set_sampled")
+
+// The all-zero trace id, as text.
+//
+// Published so that a caller comparing against it does not write
+// thirty-two characters by hand and get thirty-one.
+//
+// ```novo
+// use trctx
+//
+// fn main() [io]
+//     println(trctx.invalid_trace_id())
+// ```
+pub fn invalid_trace_id() -> Str []
+    todo("tracing-nv.trctx.invalid_trace_id")
+
+// The all-zero span id, as text.
+//
+// ```novo
+// use trctx
+//
+// fn main() [io]
+//     println(trctx.invalid_span_id())
+// ```
+pub fn invalid_span_id() -> Str []
+    todo("tracing-nv.trctx.invalid_span_id")

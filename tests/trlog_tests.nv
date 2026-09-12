@@ -1,0 +1,145 @@
+// trlog_tests.nv — the join key, in both directions.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: tracing-nv.trlog.<fn>`.
+//
+// THE CASE WORTH THE FILE is the invalid context.  A log line carrying
+// an all-zero trace id LOOKS correlated and joins to nothing, so an
+// operator filters a backend by it, gets an empty result, and concludes
+// the logs are missing rather than that the trace never existed.  Adding
+// nothing is the honest answer and it is asserted here.
+
+use std.test
+use std.list
+use lgrecord
+use lgsink
+use lgfilter
+use trctx
+use trlog
+use trspan
+
+fn a_context() -> TrSpanContext
+    trctx.span_context("4bf92f3577b34da6a3ce929d0e0e4736",
+                       "00f067aa0ba902b7", 1, "", false)
+
+fn a_record() -> LgRecord
+    lgrecord.record(LgInfo, "http.server", "request served")
+
+@test
+fn test_the_three_keys_are_the_data_models_own() [io]
+    test.case("a collector's correlation is an exact string match on these")
+    test.assert(trlog.trace_id_key() == "trace_id")
+    test.assert(trlog.span_id_key() == "span_id")
+    test.assert(trlog.trace_flags_key() == "trace_flags")
+
+@test
+fn test_a_record_gains_exactly_three_fields() [io]
+    let r = trlog.with_trace(a_record(), a_context())
+
+    test.case("three and no more")
+    test.assert(list.len(r.fields) == 3)
+
+    test.case("the trace id is readable back out")
+    test.assert(trlog.trace_id_of(r) == Some("4bf92f3577b34da6a3ce929d0e0e4736"))
+
+    test.case("and so is the span id")
+    test.assert(trlog.span_id_of(r) == Some("00f067aa0ba902b7"))
+
+@test
+fn test_an_invalid_context_adds_nothing_rather_than_zeroes() [io]
+    let r = trlog.with_trace(a_record(), trctx.invalid_context())
+
+    test.case("no fields, because a line that looks correlated and joins to nothing is worse")
+    test.assert(list.len(r.fields) == 0)
+
+    test.case("and nothing to read back")
+    test.assert(trlog.trace_id_of(r) == None)
+
+@test
+fn test_correlating_from_a_context_unwraps_the_optional_for_the_caller() [io]
+    let with_span = trlog.with_context(a_record(), trctx.with_active(trctx.empty(),
+                                                                     a_context()))
+
+    test.case("an active span correlates")
+    test.assert(trlog.trace_id_of(with_span) == Some("4bf92f3577b34da6a3ce929d0e0e4736"))
+
+    test.case("and a context with nothing active adds nothing")
+    test.assert(list.len(trlog.with_context(a_record(), trctx.empty()).fields) == 0)
+
+@test
+fn test_a_record_can_be_asked_whether_it_is_already_correlated() [io]
+    test.case("a bare record is not")
+    test.assert(trlog.is_correlated(a_record()) == false)
+
+    test.case("a correlated one is, which is how a framework and a handler avoid doing it twice")
+    test.assert(trlog.is_correlated(trlog.with_trace(a_record(), a_context())))
+
+@test
+fn test_a_log_record_becomes_a_span_event_with_its_level_kept() [io]
+    let r = lgrecord.with_field(lgrecord.record(LgWarn, "db", "slow query"),
+                                lgrecord.field_int("rows", 40000))
+    let e = trlog.as_event(r)
+
+    test.case("the message is the event's name")
+    test.assert(e.name == "slow query")
+
+    test.case("the level survives as an attribute, because 'the warning ones' is the first question")
+    test.assert(list.len(e.attributes) > 1)
+
+@test
+fn test_a_field_value_crosses_with_its_type() [io]
+    test.case("an integer stays an integer, which is what a backend aggregates on")
+    match trlog.attr_value_of(LgvInt(200))
+        TrvInt(v)   => test.assert(v == 200)
+        TrvStr(_)   => test.assert(false)
+        TrvFloat(_) => test.assert(false)
+        TrvBool(_)  => test.assert(false)
+        _           => test.assert(false)
+
+    test.case("and a present-and-empty field becomes empty text rather than vanishing")
+    match trlog.attr_value_of(LgvNone)
+        TrvStr(v) => test.assert(v == "")
+        _         => test.assert(false)
+
+@test
+fn test_a_span_carries_a_log_line_it_was_handed() [io]
+    let s = trspan.start("GET /users", TrServer, a_context(), None, 1757548800.0)
+    let with_line = trlog.attach(s, a_record())
+
+    test.case("the line is an event on the span")
+    test.assert(list.len(with_line.events) == 1)
+
+@test
+fn test_a_span_event_comes_back_as_a_record_that_names_its_trace() [io]
+    let e = trspan.event("cache.miss", 1757548800.2, [])
+    let r = trlog.record_of_event(e, a_context(), "app")
+
+    test.case("the event's name is the message")
+    test.assert(r.message == "cache.miss")
+
+    test.case("the target is the one the caller named")
+    test.assert(r.target == "app")
+
+    test.case("and it is correlated, so the lines group even though no backend saw the span")
+    test.assert(trlog.trace_id_of(r) == Some("4bf92f3577b34da6a3ce929d0e0e4736"))
+
+@test
+fn test_a_correlated_emit_into_a_pure_sink_costs_nothing() [io]
+    let ctx = trctx.with_active(trctx.empty(), a_context())
+
+    test.case("the row is the sink's, and the null sink's is empty")
+    match trlog.emit_correlated(lgsink.null_sink(), lgfilter.filter(LgInfo),
+                                a_record(), ctx)
+        Ok(written) => test.assert(written)
+        Err(_)      => test.assert(false)
+
+@test
+fn test_a_spans_events_can_be_spilled_into_the_log() [io]
+    let s = trlog.attach(
+        trspan.start("GET /users", TrServer, a_context(), None, 1757548800.0),
+        a_record())
+
+    test.case("one event, one record")
+    match trlog.events_into(lgsink.null_sink(), lgfilter.filter(LgInfo), s)
+        Ok(n)  => test.assert(n == 1)
+        Err(_) => test.assert(false)

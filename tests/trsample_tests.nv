@@ -1,0 +1,148 @@
+// trsample_tests.nv — who decides, and what a decision means.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: tracing-nv.trsample.<fn>`.
+//
+// TWO PROPERTIES CARRY THIS FILE.  A ratio sampler must decide from the
+// TRACE ID and from nothing else, so that five services running the same
+// ratio agree about the same trace — a per-service coin at 0.1 over five
+// services keeps one trace in a hundred thousand, and nobody notices
+// because the traces that survive look fine.  And `TrRecordOnly` must be
+// recorded and not exported, which is the arm every reimplementation of
+// `decision != TrDrop` collapses.
+
+use std.test
+use std.list
+use trctx
+use trsample
+
+fn root_params(trace_id: Str, name: Str) -> TrSamplingParams
+    trsample.params(None, trace_id, name, TrServer, [], [])
+
+@test
+fn test_always_on_and_always_off_are_what_they_say() [io]
+    test.case("on keeps and exports")
+    let on = trsample.decide(trsample.always_on(),
+                             root_params("4bf92f3577b34da6a3ce929d0e0e4736", "GET /x"))
+    test.assert(on.decision == TrRecordAndSample)
+
+    test.case("off drops")
+    let off = trsample.decide(trsample.always_off(),
+                              root_params("4bf92f3577b34da6a3ce929d0e0e4736", "GET /x"))
+    test.assert(off.decision == TrDrop)
+
+@test
+fn test_the_three_decisions_are_three_different_things() [io]
+    test.case("a dropped span is not recorded and not exported")
+    test.assert(trsample.is_recorded(TrDrop) == false)
+    test.assert(trsample.is_exported(TrDrop) == false)
+
+    test.case("a record-only span IS recorded and is NOT exported")
+    test.assert(trsample.is_recorded(TrRecordOnly))
+    test.assert(trsample.is_exported(TrRecordOnly) == false)
+
+    test.case("and a sampled span is both")
+    test.assert(trsample.is_recorded(TrRecordAndSample))
+    test.assert(trsample.is_exported(TrRecordAndSample))
+
+@test
+fn test_a_ratio_sampler_decides_from_the_trace_id_alone() [io]
+    let s = trsample.trace_id_ratio(0.5)
+    let id = "4bf92f3577b34da6a3ce929d0e0e4736"
+
+    test.case("the same id twice gives the same answer, which a coin would not")
+    let a = trsample.decide(s, root_params(id, "GET /x"))
+    let b = trsample.decide(s, root_params(id, "GET /x"))
+    test.assert(a.decision == b.decision)
+
+    test.case("and the span's NAME does not enter it, so two operations in one trace agree")
+    let c = trsample.decide(s, root_params(id, "POST /y"))
+    test.assert(a.decision == c.decision)
+
+@test
+fn test_the_ratio_bounds_are_the_samplers_everyone_configures_first() [io]
+    let id = "4bf92f3577b34da6a3ce929d0e0e4736"
+
+    test.case("a ratio of one keeps everything")
+    test.assert(trsample.decide(trsample.trace_id_ratio(1.0),
+                                root_params(id, "GET /x")).decision == TrRecordAndSample)
+
+    test.case("a ratio of zero keeps nothing")
+    test.assert(trsample.decide(trsample.trace_id_ratio(0.0),
+                                root_params(id, "GET /x")).decision == TrDrop)
+
+    test.case("and a ratio outside the range is clamped rather than refused")
+    test.assert(trsample.decide(trsample.trace_id_ratio(2.0),
+                                root_params(id, "GET /x")).decision == TrRecordAndSample)
+
+@test
+fn test_a_ratio_sampler_records_the_ratio_it_used() [io]
+    let r = trsample.decide(trsample.trace_id_ratio(1.0),
+                            root_params("4bf92f3577b34da6a3ce929d0e0e4736", "GET /x"))
+
+    test.case("the attributes say what the span was sampled at")
+    test.assert(list.len(r.attributes) > 0)
+
+@test
+fn test_parent_based_inherits_and_never_asks() [io]
+    let sampled = trctx.span_context("4bf92f3577b34da6a3ce929d0e0e4736",
+                                     "00f067aa0ba902b7", 1, "", true)
+    let unsampled = trctx.span_context("4bf92f3577b34da6a3ce929d0e0e4736",
+                                       "00f067aa0ba902b7", 0, "", true)
+
+    test.case("a child of a sampled parent is sampled")
+    let a = trsample.decide(trsample.parent_based(),
+                            trsample.params(Some(sampled),
+                                            "4bf92f3577b34da6a3ce929d0e0e4736",
+                                            "GET /x", TrServer, [], []))
+    test.assert(a.decision == TrRecordAndSample)
+
+    test.case("a child of an unsampled parent is not — which is what keeps a tree whole")
+    let b = trsample.decide(trsample.parent_based(),
+                            trsample.params(Some(unsampled),
+                                            "4bf92f3577b34da6a3ce929d0e0e4736",
+                                            "GET /x", TrServer, [], []))
+    test.assert(b.decision == TrDrop)
+
+    test.case("and a root is kept, which is this sampler's own default")
+    test.assert(trsample.decide(trsample.parent_based(),
+                                root_params("4bf92f3577b34da6a3ce929d0e0e4736",
+                                            "GET /x")).decision == TrRecordAndSample)
+
+@test
+fn test_parent_based_with_root_bounds_only_the_root() [io]
+    let s = trsample.parent_based_with_root(trsample.always_off())
+    let sampled = trctx.span_context("4bf92f3577b34da6a3ce929d0e0e4736",
+                                     "00f067aa0ba902b7", 1, "", true)
+
+    test.case("a root goes through the root sampler")
+    test.assert(trsample.decide(s, root_params("4bf92f3577b34da6a3ce929d0e0e4736",
+                                               "GET /x")).decision == TrDrop)
+
+    test.case("and a child still inherits, which is the whole point of the composition")
+    test.assert(trsample.decide(s, trsample.params(Some(sampled),
+                                                   "4bf92f3577b34da6a3ce929d0e0e4736",
+                                                   "GET /x", TrServer, [], [])).decision
+                == TrRecordAndSample)
+
+@test
+fn test_dropping_names_removes_the_noise_every_service_has() [io]
+    let s = trsample.dropping_names(["GET /healthz"], trsample.always_on())
+
+    test.case("the named span is dropped")
+    test.assert(trsample.decide(s, root_params("4bf92f3577b34da6a3ce929d0e0e4736",
+                                               "GET /healthz")).decision == TrDrop)
+
+    test.case("and everything else goes to the sampler behind it")
+    test.assert(trsample.decide(s, root_params("4bf92f3577b34da6a3ce929d0e0e4736",
+                                               "GET /users")).decision == TrRecordAndSample)
+
+@test
+fn test_a_sampler_carries_its_own_name_for_the_startup_line() [io]
+    test.case("every shipped sampler names itself")
+    test.assert(trsample.always_on().name != "")
+    test.assert(trsample.always_off().name != "")
+    test.assert(trsample.trace_id_ratio(0.1).name != "")
+
+    test.case("and two samplers do not share a name")
+    test.assert(trsample.always_on().name != trsample.always_off().name)

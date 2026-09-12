@@ -1,0 +1,280 @@
+// trid.nv — the two things a trace cannot be built out of values alone:
+// an id nobody has used, and the time it is now.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS MODULE IS WHERE THE EFFECTS ARE, ALL OF THEM.  Minting an id is
+// `[rand]`, reading the clock is `[time]`, and nothing else in this
+// package outside the exporters performs anything.  Concentrating them
+// here is what makes the rest testable: a test builds contexts with
+// `trctx.span_context` and instants with a literal, and never reaches a
+// row this module declares.
+//
+// AN ID IS RANDOM, NOT A COUNTER.  The specification requires a trace id
+// to be globally unique with high probability across processes that
+// never speak to each other, which a counter cannot be; and
+// `trsample.trace_id_ratio` decides by hashing the id, so a
+// non-uniform id makes a ratio sampler keep the wrong fraction.  128
+// bits for a trace and 64 for a span, which is the specification's
+// sizing and the reason the two are different calls.
+//
+// THE TRACER IS A VALUE.  `TrTracer` is a sampler, a resource-shaped
+// scope and the id source; `start_span` is the one call that puts them
+// together, and it is where the sampling decision is made — at the root
+// only, carried into the flags, so a child's decision is its parent's.
+// See `trsample`'s module note for why that is not an optimisation.
+
+use trctx
+use trsample
+
+// What starts spans: a sampler, and the scope they are attributed to.
+//
+// A value rather than a global, for the same reason the context is:
+// a program with two subsystems that want different samplers can have
+// two, and a test can build one per case.
+pub struct TrTracer
+    sampler: TrSampler
+    scope: TrScope
+
+// A tracer with this sampler, attributed to this package's own scope.
+//
+// ```novo
+// use trid
+// use trsample
+//
+// fn main() [io]
+//     let t = trid.tracer(trsample.parent_based())
+//     println(t.sampler.name)
+// ```
+pub fn tracer(s: TrSampler) -> TrTracer []
+    todo("tracing-nv.trid.tracer")
+
+// A tracer attributed to a scope the caller names.
+//
+// What an instrumentation library builds, so its spans carry its own
+// name and version rather than this package's.
+//
+// ```novo
+// use trid
+// use trotlp
+// use trsample
+//
+// fn main() [io]
+//     let t = trid.tracer_for(trsample.parent_based(),
+//                             trotlp.scope("my-http-client", "1.2.0"))
+//     println(t.scope.name)
+// ```
+pub fn tracer_for(s: TrSampler, sc: TrScope) -> TrTracer []
+    todo("tracing-nv.trid.tracer_for")
+
+// A new 128-bit trace id, as 32 lowercase hex characters.
+//
+// `[rand]`, and it is one of exactly two rows in this package that
+// touch the machine's entropy.
+//
+// ```novo
+// use trid
+//
+// fn fresh() -> Str [rand]
+//     trid.new_trace_id()
+//
+// fn main() [io]
+//     println("a trace id nobody has used")
+// ```
+pub fn new_trace_id() -> Str [rand]
+    todo("tracing-nv.trid.new_trace_id")
+
+// A new 64-bit span id, as 16 lowercase hex characters.
+//
+// ```novo
+// use trid
+//
+// fn fresh() -> Str [rand]
+//     trid.new_span_id()
+//
+// fn main() [io]
+//     println("a span id nobody has used")
+// ```
+pub fn new_span_id() -> Str [rand]
+    todo("tracing-nv.trid.new_span_id")
+
+// The clock, as Unix epoch seconds.
+//
+// `[time]`, and it is the only row in this package that reads it.  Every
+// other function that needs an instant takes one, so a service that
+// reads the clock once per request pays for one reading and a test pays
+// for none.
+//
+// ```novo
+// use trid
+//
+// fn stamp() -> Float [time]
+//     trid.now_unix()
+//
+// fn main() [io]
+//     println("one clock reading, where it is earned")
+// ```
+pub fn now_unix() -> Float [time]
+    todo("tracing-nv.trid.now_unix")
+
+// A root span context: a new trace id, a new span id, no flags set.
+//
+// The sampled bit is CLEAR here and is set by `start_span` after the
+// sampler has run — because a context minted sampled would make a
+// dropped root's children export.
+//
+// ```novo
+// use trid
+//
+// fn fresh() -> TrSpanContext [rand]
+//     trid.root_context()
+//
+// fn main() [io]
+//     println("a root context")
+// ```
+pub fn root_context() -> TrSpanContext [rand]
+    todo("tracing-nv.trid.root_context")
+
+// A child context: the parent's trace id and trace state, a new span id,
+// and the PARENT'S FLAGS unchanged.
+//
+// The flags are inherited rather than recomputed, which is the one
+// sentence that keeps a trace whole: a child of a sampled parent is
+// sampled, a child of an unsampled parent is not, and no sampler runs.
+//
+// ```novo
+// use trid
+//
+// fn under(p: TrSpanContext) -> TrSpanContext [rand]
+//     trid.child_context(p)
+//
+// fn main() [io]
+//     println("a child of a span in this process")
+// ```
+pub fn child_context(parent: TrSpanContext) -> TrSpanContext [rand]
+    todo("tracing-nv.trid.child_context")
+
+// Start a span under this context, running the sampler if it is a root.
+//
+// The one call an instrumented function makes, and where every decision
+// in this package meets:
+//
+// - a context with no active span is a ROOT, so the sampler runs and its
+//   decision goes into the new context's sampled bit;
+// - a context with an active span is a CHILD, so the parent's flags are
+//   inherited and the sampler does not run;
+// - a `TrDrop` decision still answers a span and a context, because the
+//   context must still propagate — a downstream service that samples on
+//   its own needs this span's id as its parent — and `is_recording`
+//   is what tells the caller not to spend anything on it.
+//
+// `[rand]` and not `[time]`: the instant is a parameter, so a handler
+// that read the clock once for its own timing does not read it again.
+//
+// ```novo
+// use trid
+//
+// fn open(t: TrTracer, c: TrContext) -> TrStarted [rand]
+//     trid.start_span(t, c, "GET /users", TrServer, [], [], 1757548800.0)
+//
+// fn main() [io]
+//     println("a span, started under whatever context the caller had")
+// ```
+pub fn start_span(t: TrTracer, c: TrContext, name: Str, kind: TrSpanKind, attributes: [TrAttr],
+                  links: [TrLink], start_unix: Float) -> TrStarted [rand]
+    todo("tracing-nv.trid.start_span")
+
+// What starting a span produced.
+//
+// THREE FIELDS AND NOT ONE, because a caller needs all three and
+// deriving any of them from the others is where the mistakes are.  The
+// span is what gets finished and exported; the context is what every
+// call this function makes must be given, and forgetting to thread it
+// is how a trace becomes a list of roots; `recording` is the cheap gate
+// that says whether to spend anything on attributes at all.
+pub struct TrStarted
+    span: TrSpan
+    // The caller's context with this span active in it.
+    context: TrContext
+    // Whether the sampler said to record.  `false` means every
+    // `with_attr` on this span is wasted work.
+    recording: Bool
+
+// Would anything be recorded for this span?
+//
+// The check a caller makes before computing an expensive attribute — a
+// serialised request body, a query plan.  It reads the decision the
+// sampler already made, so it costs a field read.
+//
+// ```novo
+// use trid
+//
+// fn worth_it(s: TrStarted) -> Bool
+//     trid.is_recording(s)
+//
+// fn main() [io]
+//     println("whether a span is worth attributes")
+// ```
+pub fn is_recording(s: TrStarted) -> Bool []
+    todo("tracing-nv.trid.is_recording")
+
+// Continue a trace that arrived from another process.
+//
+// The context a server builds from its headers: the remote context
+// becomes the active one, so the first span this service starts is its
+// child rather than a root, and the sampler does not run.
+//
+// `[]` — extraction is `trprop`'s and is pure; this is the one line
+// that joins the two, published so that the ordering (extract, then
+// continue, then start) is a call rather than a paragraph.
+//
+// ```novo
+// use trid
+// use trprop
+//
+// fn inbound(tp: Str, ts: Str) -> TrContext
+//     trid.continue_trace(trprop.extract(tp, ts))
+//
+// fn main() [io]
+//     println("a context continuing a trace from upstream")
+// ```
+pub fn continue_trace(p: TrPropagation) -> TrContext []
+    todo("tracing-nv.trid.continue_trace")
+
+// A tracer whose ids come from a fixed seed rather than the machine.
+//
+// `[]`, and it is what a test uses: the ids are derived from a counter
+// the caller supplies, so a whole trace is reproducible and an
+// assertion can name a span id.  It is NOT for production and the name
+// says so — two processes with the same seed mint the same trace ids,
+// which is exactly the property a backend cannot survive.
+//
+// ```novo
+// use trid
+// use trsample
+//
+// fn fixture() -> TrTracer
+//     trid.seeded_tracer(trsample.always_on(), 1)
+//
+// fn main() [io]
+//     println("a tracer whose ids a test can predict")
+// ```
+pub fn seeded_tracer(s: TrSampler, seed: Int) -> TrTracer []
+    todo("tracing-nv.trid.seeded_tracer")
+
+// The trace and span ids a seeded tracer would mint at this step.
+//
+// `[]`, published so a test can assert on the ids it is about to see
+// rather than reading them back out of the span it just built.
+//
+// ```novo
+// use trid
+//
+// fn expected(seed: Int, step: Int) -> (Str, Str)
+//     trid.seeded_ids(seed, step)
+//
+// fn main() [io]
+//     println("the ids a seeded tracer will mint")
+// ```
+pub fn seeded_ids(seed: Int, step: Int) -> (Str, Str) []
+    todo("tracing-nv.trid.seeded_ids")

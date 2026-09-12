@@ -1,0 +1,276 @@
+// trlog.nv — a log line and a span, findable from each other.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS MODULE IS THE REASON ANYBODY RUNS BOTH.  A trace tells an
+// operator that a request took four seconds and which call took them; a
+// log tells them what the code was complaining about while it did.
+// Neither answers the other's question, and the moment somebody has a
+// slow trace in one window and a log in another, the only thing they
+// want is the log lines from THIS span.
+//
+// That is one join key and it costs three fields: `trace_id`, `span_id`
+// and `trace_flags`, on every record, spelled the way OpenTelemetry's
+// own logs data model spells them — so a collector that already knows
+// how to correlate finds them without being configured.
+//
+// THE CONVERSION IS PURE.  Every row here is `[]` except the two that
+// put records into a caller's sink, which are `[e]`.  A caller that
+// already has an `LgRecord` and a `TrContext` pays nothing to join
+// them.
+//
+// IT GOES THE OTHER WAY TOO.  `as_event` turns a log record into a span
+// event, which is what a caller wants for the handful of lines that
+// belong to one operation rather than to the service: a retry, a cache
+// miss, the reason a request was refused.  Events travel with the span
+// and need no correlation at all — the trade is that they are dropped
+// when the span is, so an unsampled request's events are gone while its
+// log lines are not.
+
+use lgrecord
+use lgsink
+
+// The three field keys this module writes.
+//
+// `trace_id`, `span_id`, `trace_flags` — OpenTelemetry's logs data
+// model names, published as functions rather than as literals at four
+// call sites, because a collector's correlation is an exact-string
+// match and a record carrying `traceId` on some lines and `trace_id` on
+// others correlates half a service.
+//
+// ```novo
+// use trlog
+//
+// fn main() [io]
+//     println(trlog.trace_id_key())
+// ```
+pub fn trace_id_key() -> Str []
+    todo("tracing-nv.trlog.trace_id_key")
+
+// The span id field key.
+//
+// ```novo
+// use trlog
+//
+// fn main() [io]
+//     println(trlog.span_id_key())
+// ```
+pub fn span_id_key() -> Str []
+    todo("tracing-nv.trlog.span_id_key")
+
+// The trace flags field key.
+//
+// ```novo
+// use trlog
+//
+// fn main() [io]
+//     println(trlog.trace_flags_key())
+// ```
+pub fn trace_flags_key() -> Str []
+    todo("tracing-nv.trlog.trace_flags_key")
+
+// The record with this span context's three correlation fields added.
+//
+// A context that is not valid adds NOTHING rather than adding zeroes:
+// a log line carrying an all-zero trace id looks correlated and joins
+// to nothing, which costs an operator more time than a line that
+// plainly has no trace on it.
+//
+// ```novo
+// use trlog
+//
+// fn joined(r: LgRecord, c: TrSpanContext) -> LgRecord
+//     trlog.with_trace(r, c)
+//
+// fn main() [io]
+//     println("a log record a trace can be found from")
+// ```
+pub fn with_trace(r: LgRecord, c: TrSpanContext) -> LgRecord []
+    todo("tracing-nv.trlog.with_trace")
+
+// The record with the active span's correlation fields added, if there
+// is one.
+//
+// The call a request handler makes: it has a `TrContext` already,
+// because it threaded one, and it does not want to unwrap the optional
+// at every log line.
+//
+// ```novo
+// use trlog
+//
+// fn joined(r: LgRecord, c: TrContext) -> LgRecord
+//     trlog.with_context(r, c)
+//
+// fn main() [io]
+//     println("a log record joined to whatever span is active")
+// ```
+pub fn with_context(r: LgRecord, c: TrContext) -> LgRecord []
+    todo("tracing-nv.trlog.with_context")
+
+// The trace id a record carries, or `None`.
+//
+// The read half, for a tool that groups a log file by trace — which is
+// the offline version of what a backend does live, and the one anybody
+// with a log file and no backend actually runs.
+//
+// ```novo
+// use trlog
+//
+// fn which(r: LgRecord) -> ?Str
+//     trlog.trace_id_of(r)
+//
+// fn main() [io]
+//     println("the trace a log line belongs to")
+// ```
+pub fn trace_id_of(r: LgRecord) -> ?Str []
+    todo("tracing-nv.trlog.trace_id_of")
+
+// The span id a record carries, or `None`.
+//
+// ```novo
+// use trlog
+//
+// fn which(r: LgRecord) -> ?Str
+//     trlog.span_id_of(r)
+//
+// fn main() [io]
+//     println("the span a log line belongs to")
+// ```
+pub fn span_id_of(r: LgRecord) -> ?Str []
+    todo("tracing-nv.trlog.span_id_of")
+
+// Is this record already correlated?
+//
+// Published because adding the fields twice is what happens when a
+// framework correlates and a handler correlates too, and the duplicate
+// keys are then reported by `lgrecord.reserved_or_duplicate_keys`
+// rather than by anything that knows why.
+//
+// ```novo
+// use trlog
+//
+// fn already(r: LgRecord) -> Bool
+//     trlog.is_correlated(r)
+//
+// fn main() [io]
+//     println("whether a record already names its trace")
+// ```
+pub fn is_correlated(r: LgRecord) -> Bool []
+    todo("tracing-nv.trlog.is_correlated")
+
+// A log record as a span event.
+//
+// The level becomes an attribute rather than being dropped, because a
+// backend's event view shows a list of names and "the warning ones"
+// is the first question anybody asks of it.  The record's own fields
+// become the event's attributes, typed across: an `LgvInt` is a
+// `TrvInt` and not text.
+//
+// ```novo
+// use trlog
+//
+// fn inside(r: LgRecord) -> TrEvent
+//     trlog.as_event(r)
+//
+// fn main() [io]
+//     println("a log line, carried inside the span it happened in")
+// ```
+pub fn as_event(r: LgRecord) -> TrEvent []
+    todo("tracing-nv.trlog.as_event")
+
+// The span with this log record recorded as an event on it.
+//
+// ```novo
+// use trlog
+//
+// fn note(s: TrSpan, r: LgRecord) -> TrSpan
+//     trlog.attach(s, r)
+//
+// fn main() [io]
+//     println("a span, carrying a log line")
+// ```
+pub fn attach(s: TrSpan, r: LgRecord) -> TrSpan []
+    todo("tracing-nv.trlog.attach")
+
+// One log field value as one attribute value.
+//
+// Four of logging-nv's five arms cross unchanged; `LgvNone` becomes an
+// empty `TrvStr`, because OTLP has no null attribute value and a field
+// that vanished would make "we looked and there was nothing"
+// indistinguishable from "we did not look" on the span side.
+//
+// ```novo
+// use trlog
+//
+// fn crossed(v: LgValue) -> TrAttrValue
+//     trlog.attr_value_of(v)
+//
+// fn main() [io]
+//     println("a log field value, as a span attribute value")
+// ```
+pub fn attr_value_of(v: LgValue) -> TrAttrValue []
+    todo("tracing-nv.trlog.attr_value_of")
+
+// Emit a record correlated to the active span, through a sink.
+//
+// THE ROW IS `[e]`, so a correlated log line costs exactly what the
+// caller's own sink costs — nothing at all into a test's buffer.  It is
+// the two-call sequence (`with_context`, then emit) published as one,
+// because the correlation is the step every handler forgets on the one
+// line it added in a hurry.
+//
+// ```novo
+// use lgfilter
+// use lgsink
+// use trlog
+//
+// fn note<S: lgsink.LgSink[e]>(to: S, f: LgFilter, r: LgRecord,
+//                              c: TrContext) -> Result<Bool, LgSinkFault> [e]
+//     trlog.emit_correlated(to, f, r, c)
+//
+// fn main() [io]
+//     println("a correlated log line, charged what the sink costs")
+// ```
+pub fn emit_correlated<S: LgSink[e]>(to: S, f: LgFilter, r: LgRecord,
+                                     c: TrContext) -> Result<Bool, LgSinkFault> [e]
+    todo("tracing-nv.trlog.emit_correlated")
+
+// Emit every event on a finished span as a log record, through a sink.
+//
+// The other direction, and it is what a service without a trace backend
+// runs: the spans go nowhere and the events still reach the log, so
+// instrumenting with events costs nothing when nobody is collecting
+// traces.  Each record takes the span's own correlation fields, so the
+// lines group even though no backend saw the span.
+//
+// ```novo
+// use lgfilter
+// use lgsink
+// use trlog
+//
+// fn spill<S: lgsink.LgSink[e]>(to: S, f: LgFilter,
+//                               s: TrSpan) -> Result<Int, LgSinkFault> [e]
+//     trlog.events_into(to, f, s)
+//
+// fn main() [io]
+//     println("a span's events, in the log")
+// ```
+pub fn events_into<S: LgSink[e]>(to: S, f: LgFilter, s: TrSpan) -> Result<Int, LgSinkFault> [e]
+    todo("tracing-nv.trlog.events_into")
+
+// A span event as a log record at this level, under this target.
+//
+// The conversion `events_into` makes, published on its own for a caller
+// that wants to filter or reshape before emitting.
+//
+// ```novo
+// use trlog
+//
+// fn back(e: TrEvent, c: TrSpanContext) -> LgRecord
+//     trlog.record_of_event(e, c, "app")
+//
+// fn main() [io]
+//     println("a span event, as a log record")
+// ```
+pub fn record_of_event(e: TrEvent, c: TrSpanContext, target: Str) -> LgRecord []
+    todo("tracing-nv.trlog.record_of_event")

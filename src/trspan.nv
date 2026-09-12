@@ -1,0 +1,447 @@
+// trspan.nv — a span, and everything hung on it.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A SPAN IS A VALUE THAT IS FINISHED, NOT AN OBJECT THAT IS OPEN.  Every
+// tracing library in an imperative language hands back a live handle and
+// mutates it: `span.set_attribute(...)`, `span.end()`.  That shape needs
+// interior mutability, which costs `[mutate]` on every call, and it
+// leaves a span whose lifetime is a run-time fact nobody can check —
+// the commonest tracing bug in production is a span nobody ended, and it
+// shows up as a trace that is simply missing.
+//
+// Here `start` answers a `TrSpan` with `end_unix` at `0.0`, every
+// `with_*` answers a new one, and `finish` answers the one an exporter
+// takes.  `is_finished` is a predicate a caller can assert on, so "a
+// span nobody ended" is a test rather than an outage, and none of it
+// costs an effect.
+//
+// TIME IS A PARAMETER.  `start` and `finish` take the instant; reading
+// the clock is `trid.now_unix` at `[time]`, once, by the caller.  A span
+// that stamped itself would charge `[time]` to a `core` caller and make
+// every test of a duration need a sleep.
+//
+// ATTRIBUTES ARE TYPED AND ORDERED.  OpenTelemetry's attribute value is
+// a string, a number, a boolean or an array of one of those, and a
+// library that flattened them to text loses the one thing a backend
+// aggregates on.  They are a LIST rather than a map because the
+// specification defines no uniqueness rule a library may enforce on a
+// caller's behalf — `duplicate_keys` reports instead.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+// What kind of thing the span measured.
+//
+// The five the specification defines, and the distinction is not
+// cosmetic: a backend builds its service graph from `TrClient` and
+// `TrServer` pairs, and a span that called itself `TrInternal` when it
+// crossed a process boundary leaves a hole in that graph that no
+// attribute can fill.
+pub enum TrSpanKind
+    // Work inside one process; the default and the commonest.
+    TrInternal
+    // An outbound request, ended when the response arrives.
+    TrClient
+    // An inbound request, ended when the response is written.
+    TrServer
+    // A message put on a queue; ends when the put returns, not when
+    // anybody consumes it.
+    TrProducer
+    // A message taken off a queue.
+    TrConsumer
+
+// One attribute's value.
+//
+// Four scalars and three arrays, which is exactly the specification's
+// set.  There is no nested arm: a span attribute is flat by design,
+// because a backend indexes on it and cannot index what it cannot
+// flatten.  A caller with structure to record puts it in an event, or
+// renders it and says so.
+pub enum TrAttrValue
+    TrvStr(v: Str)
+    TrvInt(v: Int)
+    TrvFloat(v: Float)
+    TrvBool(v: Bool)
+    TrvStrList(v: [Str])
+    TrvIntList(v: [Int])
+    TrvBoolList(v: [Bool])
+
+// One attribute.
+pub struct TrAttr
+    key: Str
+    value: TrAttrValue
+
+// Something that happened at an instant inside a span.
+//
+// An event rather than a child span when there is no duration to
+// measure: a cache miss, a retry, a message received.  A trace made of
+// zero-length spans is unreadable and costs a backend the same as one
+// made of real ones.
+pub struct TrEvent
+    name: Str
+    // Unix epoch seconds, the caller's reading.
+    at_unix: Float
+    attributes: [TrAttr]
+
+// A causal edge to a span in another trace.
+//
+// What a batch consumer uses: one span processing fifty messages links
+// to fifty producing spans, and none of them is its parent.  Modelling
+// that as a parent would make one of the fifty arbitrarily special.
+pub struct TrLink
+    context: TrSpanContext
+    attributes: [TrAttr]
+
+// Whether the operation the span measured succeeded.
+//
+// Three, and `TrUnset` is not the same as `TrOk`.  `TrUnset` is the
+// default and means nobody said; `TrOk` means somebody looked and it
+// was fine, which a backend treats differently — an instrumentation
+// library sets `TrError` and leaves `TrOk` for the application, so that
+// a service's own success criteria are not overwritten by a library
+// that only knows the HTTP status.
+pub enum TrStatusCode
+    TrUnset
+    TrOk
+    TrError
+
+// The status, and why.
+//
+// `description` is only meaningful on `TrError`; the specification says
+// so, and a library that carried one on `TrOk` produces spans a backend
+// silently drops the text from.
+pub struct TrStatus
+    code: TrStatusCode
+    description: Str
+
+// One measured operation.
+//
+// `end_unix` is `0.0` until `finish`, which is what `is_finished`
+// reads.  `context` carries this span's own ids and the sampled flag;
+// `parent` is `None` for a root.
+pub struct TrSpan
+    name: Str
+    kind: TrSpanKind
+    context: TrSpanContext
+    parent: ?TrSpanContext
+    start_unix: Float
+    end_unix: Float
+    attributes: [TrAttr]
+    events: [TrEvent]
+    links: [TrLink]
+    status: TrStatus
+
+// Begin a span.
+//
+// The context is built by `trid.child_context` or
+// `trid.root_context` — this call does not mint ids, because minting
+// them is `[rand]` and a span that did it could not be built in a test
+// with fixed ids.
+//
+// ```novo
+// use trspan
+//
+// fn open(c: TrSpanContext) -> TrSpan
+//     trspan.start("GET /users", TrServer, c, None, 1757548800.0)
+//
+// fn main() [io]
+//     println("a span, begun")
+// ```
+pub fn start(name: Str, kind: TrSpanKind, context: TrSpanContext, parent: ?TrSpanContext,
+             start_unix: Float) -> TrSpan []
+    todo("tracing-nv.trspan.start")
+
+// End a span at this instant.
+//
+// Finishing a span that is already finished answers it unchanged rather
+// than refusing: a `Result` here would put a failure path on the exit
+// of every instrumented function, and the double end is a caller bug
+// that `is_finished` reports without one.
+//
+// ```novo
+// use trspan
+//
+// fn close(s: TrSpan) -> TrSpan
+//     trspan.finish(s, 1757548800.5)
+//
+// fn main() [io]
+//     println("a span, ended")
+// ```
+pub fn finish(s: TrSpan, end_unix: Float) -> TrSpan []
+    todo("tracing-nv.trspan.finish")
+
+// Has this span been ended?
+//
+// The predicate that turns "a span nobody ended" from an outage into an
+// assertion.
+//
+// ```novo
+// use trspan
+//
+// fn check(s: TrSpan) -> Bool
+//     trspan.is_finished(s)
+//
+// fn main() [io]
+//     println("whether a span was ended")
+// ```
+pub fn is_finished(s: TrSpan) -> Bool []
+    todo("tracing-nv.trspan.is_finished")
+
+// How long the span took, in seconds, or `0.0` if it has not ended.
+//
+// ```novo
+// use trspan
+//
+// fn took(s: TrSpan) -> Float
+//     trspan.duration_seconds(s)
+//
+// fn main() [io]
+//     println("a span's duration")
+// ```
+pub fn duration_seconds(s: TrSpan) -> Float []
+    todo("tracing-nv.trspan.duration_seconds")
+
+// The span with one more attribute.
+//
+// ```novo
+// use trspan
+//
+// fn tag(s: TrSpan) -> TrSpan
+//     trspan.with_attr(s, trspan.attr_int("http.status_code", 200))
+//
+// fn main() [io]
+//     println("a span, tagged")
+// ```
+pub fn with_attr(s: TrSpan, a: TrAttr) -> TrSpan []
+    todo("tracing-nv.trspan.with_attr")
+
+// The span with these attributes appended.
+//
+// ```novo
+// use trspan
+//
+// fn tag(s: TrSpan, attrs: [TrAttr]) -> TrSpan
+//     trspan.with_attrs(s, attrs)
+//
+// fn main() [io]
+//     println("a span, tagged several times")
+// ```
+pub fn with_attrs(s: TrSpan, attrs: [TrAttr]) -> TrSpan []
+    todo("tracing-nv.trspan.with_attrs")
+
+// The span with one more event.
+//
+// ```novo
+// use trspan
+//
+// fn note(s: TrSpan) -> TrSpan
+//     trspan.with_event(s, trspan.event("cache.miss", 1757548800.2, []))
+//
+// fn main() [io]
+//     println("a span, with something noted inside it")
+// ```
+pub fn with_event(s: TrSpan, e: TrEvent) -> TrSpan []
+    todo("tracing-nv.trspan.with_event")
+
+// The span with one more causal link.
+//
+// ```novo
+// use trspan
+//
+// fn join(s: TrSpan, l: TrLink) -> TrSpan
+//     trspan.with_link(s, l)
+//
+// fn main() [io]
+//     println("a span, linked to another trace")
+// ```
+pub fn with_link(s: TrSpan, l: TrLink) -> TrSpan []
+    todo("tracing-nv.trspan.with_link")
+
+// The span with this status.
+//
+// ```novo
+// use trspan
+//
+// fn failed(s: TrSpan) -> TrSpan
+//     trspan.with_status(s, trspan.error_status("upstream timed out"))
+//
+// fn main() [io]
+//     println("a span, marked failed")
+// ```
+pub fn with_status(s: TrSpan, st: TrStatus) -> TrSpan []
+    todo("tracing-nv.trspan.with_status")
+
+// The span with an exception recorded as the specification's event.
+//
+// A named call rather than prose, because the event's name and its
+// three attribute keys are fixed by the specification — `exception`,
+// `exception.type`, `exception.message`, `exception.stacktrace` — and a
+// backend's exception view finds nothing if any of them is spelled
+// differently.  Every library that writes them by hand gets one wrong
+// eventually.
+//
+// It does NOT set the status: the specification leaves that to the
+// caller, because an exception that was caught and handled is not a
+// failed operation.
+//
+// ```novo
+// use trspan
+//
+// fn caught(s: TrSpan) -> TrSpan
+//     trspan.record_exception(s, "TimeoutError", "upstream timed out", "",
+//                             1757548800.4)
+//
+// fn main() [io]
+//     println("an exception, recorded where a backend looks for it")
+// ```
+pub fn record_exception(s: TrSpan, kind: Str, message: Str, stacktrace: Str,
+                        at_unix: Float) -> TrSpan []
+    todo("tracing-nv.trspan.record_exception")
+
+// An event.
+//
+// ```novo
+// use trspan
+//
+// fn main() [io]
+//     println(trspan.event("cache.miss", 1757548800.2, []).name)
+// ```
+pub fn event(name: Str, at_unix: Float, attributes: [TrAttr]) -> TrEvent []
+    todo("tracing-nv.trspan.event")
+
+// A link to a span in another trace.
+//
+// ```novo
+// use trspan
+//
+// fn to(c: TrSpanContext) -> TrLink
+//     trspan.link(c, [])
+//
+// fn main() [io]
+//     println("a causal edge to another trace")
+// ```
+pub fn link(context: TrSpanContext, attributes: [TrAttr]) -> TrLink []
+    todo("tracing-nv.trspan.link")
+
+// An attribute whose value is text.
+//
+// ```novo
+// use trspan
+//
+// fn main() [io]
+//     println(trspan.attr_str("http.method", "GET").key)
+// ```
+pub fn attr_str(key: Str, v: Str) -> TrAttr []
+    todo("tracing-nv.trspan.attr_str")
+
+// An attribute whose value is a whole number.
+//
+// ```novo
+// use trspan
+//
+// fn main() [io]
+//     println(trspan.attr_int("http.status_code", 200).key)
+// ```
+pub fn attr_int(key: Str, v: Int) -> TrAttr []
+    todo("tracing-nv.trspan.attr_int")
+
+// An attribute whose value is a real number.
+//
+// ```novo
+// use trspan
+//
+// fn main() [io]
+//     println(trspan.attr_float("db.duration_ms", 12.5).key)
+// ```
+pub fn attr_float(key: Str, v: Float) -> TrAttr []
+    todo("tracing-nv.trspan.attr_float")
+
+// An attribute whose value is true or false.
+//
+// ```novo
+// use trspan
+//
+// fn main() [io]
+//     println(trspan.attr_bool("http.request.resend", false).key)
+// ```
+pub fn attr_bool(key: Str, v: Bool) -> TrAttr []
+    todo("tracing-nv.trspan.attr_bool")
+
+// The unset status, which is what a span starts with.
+//
+// ```novo
+// use trspan
+//
+// fn main() [io]
+//     println("${trspan.unset_status().code == TrUnset}")
+// ```
+pub fn unset_status() -> TrStatus []
+    todo("tracing-nv.trspan.unset_status")
+
+// The ok status, which only an application sets.
+//
+// ```novo
+// use trspan
+//
+// fn main() [io]
+//     println("${trspan.ok_status().code == TrOk}")
+// ```
+pub fn ok_status() -> TrStatus []
+    todo("tracing-nv.trspan.ok_status")
+
+// The error status, with the description a backend shows.
+//
+// ```novo
+// use trspan
+//
+// fn main() [io]
+//     println(trspan.error_status("upstream timed out").description)
+// ```
+pub fn error_status(description: Str) -> TrStatus []
+    todo("tracing-nv.trspan.error_status")
+
+// The value of the first attribute under this key, or `None`.
+//
+// ```novo
+// use trspan
+//
+// fn code(s: TrSpan) -> ?TrAttrValue
+//     trspan.attr_of(s, "http.status_code")
+//
+// fn main() [io]
+//     println("an attribute, looked up")
+// ```
+pub fn attr_of(s: TrSpan, key: Str) -> ?TrAttrValue []
+    todo("tracing-nv.trspan.attr_of")
+
+// Every attribute key this span carries more than once.
+//
+// REPORTED AND NOT DEDUPLICATED.  The specification says a duplicate
+// key is undefined behaviour and leaves the choice to the
+// implementation; every choice loses something, and which one is right
+// depends on whether the second write was a correction or a bug.  So
+// the span keeps both and this says so, which is what lets a test catch
+// the instrumentation that is writing `http.method` twice.
+//
+// ```novo
+// use trspan
+//
+// fn clashes(s: TrSpan) -> [Str]
+//     trspan.duplicate_keys(s)
+//
+// fn main() [io]
+//     println("the attribute keys written twice")
+// ```
+pub fn duplicate_keys(s: TrSpan) -> [Str] []
+    todo("tracing-nv.trspan.duplicate_keys")
+
+// The span kind as the word the OTLP encoding uses.
+//
+// ```novo
+// use trspan
+//
+// fn main() [io]
+//     println(trspan.kind_name(TrServer))
+// ```
+pub fn kind_name(k: TrSpanKind) -> Str []
+    todo("tracing-nv.trspan.kind_name")
