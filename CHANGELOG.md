@@ -5,6 +5,10 @@ All notable changes to tracing-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.2 — 2026-09-15
+
+README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
+
 ## 0.0.1 — 2026-09-11
 
 The **interface**: every signature and every effect row, and no bodies.
@@ -53,3 +57,22 @@ The **interface**: every signature and every effect row, and no bodies.
 - **No device claim.** A trace id is 32 characters of text and the span
   carries three lists; neither links at `@tier(embedded)`.
 - **One dependency**, logging-nv, by path here and by range at publish.
+
+### Design notes
+
+- `TrSampler` is a struct with a function-typed field rather than a
+  trait or a lambda.  A trait's bounds carry an effect argument and
+  never a type one, and a lambda that becomes a value is refused at
+  `@tier(embedded)`.  The field is filled with a named function, which
+  is the arrangement proptest-core-nv and matchers-nv arrived at for the
+  same two reasons.
+- JSON rather than protobuf.  OTLP defines both over HTTP and every
+  collector accepts JSON.  Protobuf would want a `protobuf-nv`
+  dependency and a generated schema this package has no way to check
+  against the specification.  The cost is size: a JSON span is roughly
+  three times its protobuf, and the README names that rather than
+  leaving it to be discovered from an egress bill.
+- `trlog` costs a consumer logging-nv's whole closure.  A service that
+  wants spans and no device still assembles deflog-decoder and the four
+  packages behind it.  That is the second argument for splitting
+  logging-nv's `core` half out, which logging-core-nv 0.0.1 now is.
