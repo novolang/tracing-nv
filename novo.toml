@@ -1,7 +1,7 @@
 [package]
 name        = "tracing-nv"
 license     = "Apache-2.0"
-version     = "0.0.2"
+version     = "0.0.3"
 description = "OpenTelemetry tracing as values: a span with attributes, events, links and a status; a parent/child context the caller threads rather than a thread-local; W3C traceparent and tracestate as a pure codec; samplers as named functions whose decision is made once and carried in the sampled flag; and a batch exporter contract with the OTLP/JSON encoding as the shipped one.  Interface only — every body is a todo()."
 
 # `license` sits immediately after the name, before any value that could
