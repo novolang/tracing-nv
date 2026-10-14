@@ -11,11 +11,6 @@ all three to novo-lang. It is built on
 [logging-nv](https://novo-lang.org/packages/logging-nv), which supplies the log
 record that a span's identifiers are written into.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared with
-its full signature, but every body is a `todo()` that panics when called. The
-package is published so its design can be reviewed and depended on before it is
-implemented. Version 0.1.0 will be the first working release.
-
 ## What it is
 
 A **span** is one unit of work with a name, a start instant and an end instant.
@@ -100,8 +95,7 @@ fn main() [io, rand, time]
     println(trotlp.encode(trotlp.resource("users", []), trotlp.this_scope(), [done]))
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test` fails on
-purpose: every test reaches a `not implemented` panic.
+Build and test with `novo pkg build` and `novo test`.
 
 ## What the package contains
 
@@ -113,7 +107,7 @@ purpose: every test reaches a `not implemented` panic.
 | `trsample` | The samplers: always, never, a ratio of the trace id, the parent's decision, a composition of the two, and one that drops by span name. |
 | `trexport` | The `TracingExporter[e]` trait, the outcome type, the batch queue with its three bounds, and the in-memory exporter a test drains. |
 | `trotlp` | The OTLP/JSON document, encoded from spans, and the exporter that sends it over HTTP. |
-| `trid` | The two things a value cannot supply: a random identifier and the current time. Also the tracer, and a seeded tracer for tests. |
+| `trid` | The two things a value cannot supply: a random identifier and the current time. Also the tracer, and a seeded derivation of identifiers a test can name. |
 | `trlog` | The join between a log line and a span, in both directions. |
 
 ## How to choose an entry point
@@ -128,9 +122,10 @@ headers and answers a context that is always usable. Pass it to
 `trid.continue_trace`. On the way out, `trprop.inject_traceparent` and
 `inject_tracestate` write the headers for a downstream call.
 
-**A test starts at `trid.seeded_tracer`.** Its identifiers are predictable, so a
-suite can assert which trace id a child carried, not merely that it carried
-one.
+**A test starts at `trid.seeded_ids`.** A seed and a step derive a trace id and a
+span id with no effect row at all, so a fixture can name the pair it is about to
+see; `trid.seeded_tracer` is the same idea for the sampler, which is the half of
+the decision a test needs fixed.
 
 **Exporting has two halves, and they are separate calls.**
 `trotlp.encode` answers the exact JSON document a collector would receive and
@@ -144,6 +139,9 @@ call `flush_into` with its exporter.
 
 **A test collects spans with `trexport.memory_exporter`.** It writes into a slot
 the caller owns, so the pipeline costs `[mutate]` and reaches no collector.
+`trexport.clear_slot` empties a slot, which is what a test that asserts on what
+a fresh exporter received calls first — and what a service starting a new export
+run over storage an earlier one used calls too.
 
 **A service that also logs calls `trlog.with_trace`.** It puts the trace id, the
 span id and the trace flags onto a log record, which is the one thing that makes
@@ -236,7 +234,9 @@ a log line and a span findable from each other.
 - **Ambient context.** There is no thread-local current span. An instrumented
   function takes a `TrContext` and returns one, which is one parameter per
   boundary. A task moved between threads keeps its context, and a test asserts
-  `child.context.trace_id == parent.context.trace_id` with no setup.
+  `child.context.trace_id == parent.context.trace_id` with no setup. The one
+  module-level variable in the package is the in-memory exporter's slot table,
+  and the caller names the slot.
 - **Metrics.** A metric is a different signal with a different document.
   `std.otlp`'s `record_metric` keeps them, so a program has one endpoint to
   configure rather than two.
@@ -272,20 +272,26 @@ a log line and a span findable from each other.
 ## Tests
 
 ```bash
-novo test tests                            # every suite
+novo test --isolate tests/<suite>.nv       # one suite, in the runner's isolating mode
+novo test tests                            # every suite in one pass
+novo test tests/tracing_nv_edge_tests.nv   # the edges: the empty batch, the refusals, the socket
 novo test tests/trspan_tests.nv            # a span as a value, and its states
 novo test tests/trctx_tests.nv             # the context, and the flags byte
 novo test tests/trprop_tests.nv            # the W3C headers, and the restart rule
 novo test tests/trsample_tests.nv          # who decides, and what a decision means
 novo test tests/trexport_tests.nv          # the batch, and the exporter trait
 novo test tests/trotlp_tests.nv            # the document a collector receives
-novo test tests/trid_tests.nv              # the effects, and the seeded tracer
+novo test tests/trid_tests.nv              # the effects, and the seeded identifiers
 novo test tests/trlog_tests.nv             # the join key, in both directions
 ```
 
-`novo test` fails on purpose today. Every assertion reaches a `not implemented:
-tracing-nv.<module>.<fn>` panic, because every body is a `todo()`. The tests are
-the specification the implementation will have to satisfy.
+`novo test tests` runs every suite green in one process. The one piece of
+module-level state in the package is the in-memory exporter's slot table — a
+`TrMemoryExporter` is a value, so the spans have to live where the caller can
+read them — and a test that asserts on what a FRESH exporter received empties
+the slot it is about first with `trexport.clear_slot`, which is also the call a
+consumer makes before a new export run over old storage. `--isolate` runs each
+test against fresh module state and needs none of this.
 
 The reference data is the specifications' own: W3C Trace Context's example
 headers and its list of invalid ones, OpenTelemetry's span kind and status
@@ -304,27 +310,16 @@ seven alone. `tests/trexport_tests.nv` carries an assertion the compiler makes
 rather than `test.assert`: a pipeline declared `[mutate]` runs over the
 in-memory exporter, whose implementation supplies exactly `[mutate]`.
 
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `trspan.TrSpanKind`, `.TrAttrValue`, `.TrAttr`, `.TrEvent`, `.TrLink`, `.TrStatusCode`, `.TrStatus`, `.TrSpan` | declared |
-| `trspan`'s twenty functions, from `start` to `kind_name` | no |
-| `trctx.TrSpanContext`, `.TrContext`, `.TrBaggage` | declared |
-| `trctx`'s twelve functions, from `empty` to `invalid_span_id` | no |
-| `trprop.TrPropagation`, `.TrPropReason` | declared |
-| `trprop`'s fourteen functions, from `extract` to `reason_message` | no |
-| `trsample.TrDecision`, `.TrSamplingResult`, `.TrSamplingParams`, `.TrSampler` | declared |
-| `trsample`'s thirteen functions, from `always_on` to `is_recorded` | no |
-| `trexport.TrExportFault` and `impl Error`, `.TrExportOutcome`, `.TracingExporter[e]`, `.TrMemoryExporter`, `.TrBatchLimits`, `.TrBatch` | declared |
-| `impl TracingExporter[mutate] for TrMemoryExporter`: `export`, `flush`, `shutdown` | no |
-| `trexport`'s thirteen functions, from `default_limits` to `is_retryable` | no |
-| `trotlp.TrResource`, `.TrScope`, `.TrOtlpExporter` | declared |
-| `impl TracingExporter[net] for TrOtlpExporter`: `export`, `flush`, `shutdown` | no |
-| `trotlp`'s fifteen functions, from `encode` to `traces_path` | no |
-| `trid.TrTracer`, `.TrStarted` | declared |
-| `trid`'s eleven functions, from `tracer` to `seeded_ids` | no |
-| `trlog`'s thirteen functions, from `trace_id_key` to `record_of_event` | no |
+`tests/tracing_nv_edge_tests.nv` is the suite for what the specification suites
+leave standing: an empty batch, a negative slot, a ratio of `2.0`, a field under
+`trace_id` that is not text, a sink that refuses, and the socket cases — which
+run against a loopback listener, so a connect, a request and a timeout are real
+without a collector in the room. What it cannot reach is the reply side: a
+collector that ANSWERS cannot be simulated from one thread, so `first_line`,
+`body_of`, `reply_status`, `answer_detail`, `answered` and the read arm of
+`collect_reply` carry the ten `cov: skip` markers in `src/trotlp.nv`, each with
+its reason beside it — the tenth is the write-failure path, which needs a
+connection that breaks between the connect and the write.
 
 ## Licence
 

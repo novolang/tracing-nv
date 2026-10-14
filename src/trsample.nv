@@ -1,14 +1,17 @@
 // trsample.nv — who decides which traces are kept, and when.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
-// A SAMPLER IS A NAMED FUNCTION IN A STRUCT, NOT A TRAIT AND NOT A
-// LAMBDA.  A trait cannot be generic over the value type here — SPEC
-// § 3.6's bounds carry an effect argument and never a type one — and a
-// lambda that becomes a value is refused at `@tier(embedded)`.  So
-// `TrSampler` holds a function-typed field, which is the arrangement
-// proptest-core-nv and matchers-nv arrived at for the same two reasons,
-// and the field is filled with a NAMED function.
+// A SAMPLER IS A FUNCTION IN A STRUCT, NOT A TRAIT AND NOT AN OBJECT.
+// A trait cannot be generic over the value type here — SPEC § 3.6's
+// bounds carry an effect argument and never a type one — so `TrSampler`
+// holds a function-typed field, which is the arrangement proptest-core-nv
+// and matchers-nv arrived at for the same reason.  Three of the six
+// shipped samplers are named functions — a sampler with no configuration
+// has nothing to carry — and three are closures over the configuration
+// they were built with, which is the only shape that reaches a decision
+// through a field whose call takes nothing but the sampling parameters.
+// A caller writing its own sampler passes a named function
+// (`TrSampler`'s field type is a plain `fn`), and the closure form is
+// refused at `@tier(embedded)`, which this package does not claim.
 //
 // THE DECISION IS MADE ONCE, AT THE ROOT, AND CARRIED.  A sampler runs
 // when a span has no parent; a span WITH a parent inherits the parent's
@@ -34,6 +37,9 @@
 // thousand, complete.
 //
 // NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+use trctx
+use trspan
 
 // What a sampler decided.
 pub enum TrDecision
@@ -91,6 +97,117 @@ pub struct TrSampler
     name: Str
     decide: fn(TrSamplingParams) -> TrSamplingResult []
 
+// keep_everything is `always_on`'s decision.
+//
+// It reads nothing, which is why it is a named function: a sampler with
+// no configuration has nothing for a lambda to capture, and a name is
+// what the field holds.
+fn keep_everything(p: TrSamplingParams) -> TrSamplingResult []
+    result(TrRecordAndSample, [], "")
+
+// keep_nothing is `always_off`'s decision.
+//
+// It drops rather than recording without exporting, because a caller
+// that asked for nothing to be kept should not pay for the attributes a
+// record-only span would compute.
+fn keep_nothing(p: TrSamplingParams) -> TrSamplingResult []
+    result(TrDrop, [], "")
+
+// hex_value is the value of a hex digit, or -1 for a byte that is not
+// one — which is what lets the ratio walk take the digits and pass over
+// everything else in a single traversal.
+fn hex_value(b: Int) -> Int []
+    if b >= '0' and b <= '9'
+        return b - '0'
+    if b >= 'a' and b <= 'f'
+        return b - 'a' + 10
+    -1
+
+// ratio_key is the first thirteen hex digits of the trace id read as an
+// integer, and it is the whole of a ratio sampler's input.
+//
+// THIRTEEN DIGITS IS NOT AN ARBITRARY CHOICE.  Thirteen hex digits is
+// fifty-two bits, the widest hex prefix that cannot overflow a signed
+// 64-bit integer, and it is far finer than any ratio a caller
+// configures.  The prefix rather than the low bits, because a trace id
+// is uniform across its length and reading it from the front is what
+// every other reader of one does.
+//
+// A non-hex byte is skipped rather than folded in, so an id that is not
+// what the specification says is still answered the same way twice.
+fn ratio_key(trace_id: Str) -> Int []
+    var key = 0
+    var taken = 0
+    for i in 0..str.len(trace_id)
+        if taken < 13
+            let v = hex_value(str.byte_at_or(trace_id, i, 0))
+            if v >= 0
+                key = key * 16 + v
+                taken = taken + 1
+    key
+
+// ratio_threshold is `ratio` clamped to `[0.0, 1.0]` and scaled to the
+// key's fifty-two bits.
+//
+// Clamped rather than refused, because a ratio arrives from
+// configuration: a deployment that wrote `2.0` meant "keep everything",
+// and one that wrote `-1.0` meant "keep nothing".  A `Result` here would
+// put a startup failure on a value the operator can see is out of range.
+fn ratio_threshold(ratio: Float) -> Int []
+    var r = ratio
+    if r < 0.0
+        r = 0.0
+    if r > 1.0
+        r = 1.0
+    // 4503599627370496 is 2^52, one past the largest key there is, so a
+    // ratio of exactly 1.0 admits every id rather than all but the last.
+    float.to_int(r * 4503599627370496.0)
+
+// ratio_attribute is what a sampled span carries so that a backend doing
+// statistics on a sampled stream knows what the stream was sampled at.
+fn ratio_attribute(ratio: Float) -> TrAttr []
+    TrAttr { key: "sampler.ratio", value: TrvFloat(ratio) }
+
+// ratio_decision is a ratio sampler's decision, with the ratio captured
+// rather than looked up.
+fn ratio_decision(ratio: Float, p: TrSamplingParams) -> TrSamplingResult []
+    if ratio_key(p.trace_id) >= ratio_threshold(ratio)
+        return result(TrDrop, [], "")
+    result(TrRecordAndSample, [ratio_attribute(ratio)], "")
+
+// parent_verdict is the decision a parent's sampled flag implies.
+//
+// One function for both parent-based samplers, because inheriting is one
+// rule: `trctx.is_sampled` rather than a comparison here, since the
+// flag is bit 0 of a byte with seven reserved neighbours.
+fn parent_verdict(parent: TrSpanContext) -> TrSamplingResult []
+    if trctx.is_sampled(parent)
+        return result(TrRecordAndSample, [], "")
+    result(TrDrop, [], "")
+
+// decide_parent_based is `parent_based`'s decision: a child inherits and
+// a root is kept.
+fn decide_parent_based(p: TrSamplingParams) -> TrSamplingResult []
+    match p.parent
+        Some(parent) => parent_verdict(parent)
+        None         => result(TrRecordAndSample, [], "")
+
+// asked_root is `parent_based_with_root`'s decision: the parent's answer
+// when there is a parent, and the captured sampler's own when there is
+// not.
+fn asked_root(root: TrSampler, p: TrSamplingParams) -> TrSamplingResult []
+    match p.parent
+        Some(parent) => parent_verdict(parent)
+        None         => decide(root, p)
+
+// over_names is `dropping_names`' decision.  The list is consulted
+// first, so a name on it costs one string comparison rather than a call
+// into the sampler behind.
+fn over_names(names: [Str], rest: TrSampler, p: TrSamplingParams) -> TrSamplingResult []
+    if list.contains(names, p.name)
+        return result(TrDrop, [], "")
+    decide(rest, p)
+
 // Keep everything.
 //
 // The right default for development and for a service that exports
@@ -104,7 +221,7 @@ pub struct TrSampler
 //     println(trsample.always_on().name)
 // ```
 pub fn always_on() -> TrSampler []
-    todo("tracing-nv.trsample.always_on")
+    TrSampler { name: "always_on", decide: keep_everything }
 
 // Keep nothing.
 //
@@ -119,7 +236,7 @@ pub fn always_on() -> TrSampler []
 //     println(trsample.always_off().name)
 // ```
 pub fn always_off() -> TrSampler []
-    todo("tracing-nv.trsample.always_off")
+    TrSampler { name: "always_off", decide: keep_nothing }
 
 // Keep the fraction of traces whose id falls below a threshold.
 //
@@ -135,7 +252,12 @@ pub fn always_off() -> TrSampler []
 //     println(trsample.trace_id_ratio(0.01).name)
 // ```
 pub fn trace_id_ratio(ratio: Float) -> TrSampler []
-    todo("tracing-nv.trsample.trace_id_ratio")
+    // A lambda rather than a named function, because the ratio has to
+    // reach the decision and `decide` receives the sampling parameters
+    // and nothing else.  This is the shape the module header describes:
+    // the field holds a function, and three of the six shipped samplers
+    // are closures because three of them are configured.
+    TrSampler { name: "trace_id_ratio", decide: p => ratio_decision(ratio, p) }
 
 // Honour the parent's sampled bit, and keep every root.
 //
@@ -148,7 +270,7 @@ pub fn trace_id_ratio(ratio: Float) -> TrSampler []
 //     println(trsample.parent_based().name)
 // ```
 pub fn parent_based() -> TrSampler []
-    todo("tracing-nv.trsample.parent_based")
+    TrSampler { name: "parent_based", decide: decide_parent_based }
 
 // Honour the parent's sampled bit, and ask this sampler about a root.
 //
@@ -163,7 +285,11 @@ pub fn parent_based() -> TrSampler []
 //     println(s.name)
 // ```
 pub fn parent_based_with_root(root: TrSampler) -> TrSampler []
-    todo("tracing-nv.trsample.parent_based_with_root")
+    // The root sampler's own name is folded in, because two compositions
+    // with different roots are two different policies and the startup
+    // line is where an operator reads which one a process runs.
+    TrSampler { name: "parent_based_with_root(${root.name})",
+                decide: p => asked_root(root, p) }
 
 // A sampler that drops spans whose name is in a list, and defers to
 // another for everything else.
@@ -182,7 +308,10 @@ pub fn parent_based_with_root(root: TrSampler) -> TrSampler []
 //     println(s.name)
 // ```
 pub fn dropping_names(names: [Str], rest: TrSampler) -> TrSampler []
-    todo("tracing-nv.trsample.dropping_names")
+    // The count rather than the names: a startup line with thirty health
+    // check paths in it is a startup line nobody reads.
+    TrSampler { name: "dropping_names(${list.len(names)})",
+                decide: p => over_names(names, rest, p) }
 
 // A sampler from a name and a function the caller wrote.
 //
@@ -200,7 +329,7 @@ pub fn dropping_names(names: [Str], rest: TrSampler) -> TrSampler []
 //     println(trsample.sampler("writes-only", keep_writes).name)
 // ```
 pub fn sampler(name: Str, decide: fn(TrSamplingParams) -> TrSamplingResult []) -> TrSampler []
-    todo("tracing-nv.trsample.sampler")
+    TrSampler { name: name, decide: decide }
 
 // Run a sampler.
 //
@@ -216,7 +345,7 @@ pub fn sampler(name: Str, decide: fn(TrSamplingParams) -> TrSamplingResult []) -
 //     println("a sampling decision")
 // ```
 pub fn decide(s: TrSampler, p: TrSamplingParams) -> TrSamplingResult []
-    todo("tracing-nv.trsample.decide")
+    s.decide(p)
 
 // A result.
 //
@@ -227,7 +356,7 @@ pub fn decide(s: TrSampler, p: TrSamplingParams) -> TrSamplingResult []
 //     println("${trsample.result(TrDrop, [], "").decision == TrDrop}")
 // ```
 pub fn result(decision: TrDecision, attributes: [TrAttr], trace_state: Str) -> TrSamplingResult []
-    todo("tracing-nv.trsample.result")
+    TrSamplingResult { decision: decision, attributes: attributes, trace_state: trace_state }
 
 // The parameters a root span presents to a sampler.
 //
@@ -241,7 +370,8 @@ pub fn result(decision: TrDecision, attributes: [TrAttr], trace_state: Str) -> T
 // ```
 pub fn params(parent: ?TrSpanContext, trace_id: Str, name: Str, kind: TrSpanKind,
               attributes: [TrAttr], links: [TrLink]) -> TrSamplingParams []
-    todo("tracing-nv.trsample.params")
+    TrSamplingParams { parent: parent, trace_id: trace_id, name: name, kind: kind,
+                       attributes: attributes, links: links }
 
 // Would a span with this decision be exported?
 //
@@ -257,7 +387,10 @@ pub fn params(parent: ?TrSpanContext, trace_id: Str, name: Str, kind: TrSpanKind
 //     println("${trsample.is_exported(TrRecordOnly)}")
 // ```
 pub fn is_exported(d: TrDecision) -> Bool []
-    todo("tracing-nv.trsample.is_exported")
+    match d
+        TrRecordAndSample => true
+        TrDrop            => false
+        TrRecordOnly      => false
 
 // Would a span with this decision be built at all?
 //
@@ -273,4 +406,7 @@ pub fn is_exported(d: TrDecision) -> Bool []
 //     println("${trsample.is_recorded(TrRecordOnly)}")
 // ```
 pub fn is_recorded(d: TrDecision) -> Bool []
-    todo("tracing-nv.trsample.is_recorded")
+    match d
+        TrDrop            => false
+        TrRecordOnly      => true
+        TrRecordAndSample => true

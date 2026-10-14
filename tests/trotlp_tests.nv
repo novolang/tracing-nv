@@ -1,8 +1,5 @@
 // trotlp_tests.nv — the document a collector receives.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: tracing-nv.trotlp.<fn>`.
-//
 // THREE FAILURES THIS SUITE EXISTS TO CATCH, and all three produce a
 // 200 from the collector and no data in the backend.  A timestamp
 // written as a JSON number, which loses microseconds in every consumer
@@ -133,7 +130,7 @@ fn test_the_endpoint_and_the_path_are_two_facts() [io]
     test.assert(trotlp.is_disabled("off"))
 
     test.case("a real URL does not")
-    test.assert(trotlp.is_disabled("http://localhost:4318") == false)
+    test.assert(not trotlp.is_disabled("http://localhost:4318"))
 
 @test
 fn test_an_exporter_carries_its_configuration() [io]

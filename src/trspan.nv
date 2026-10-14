@@ -1,7 +1,5 @@
 // trspan.nv — a span, and everything hung on it.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // A SPAN IS A VALUE THAT IS FINISHED, NOT AN OBJECT THAT IS OPEN.  Every
 // tracing library in an imperative language hands back a live handle and
 // mutates it: `span.set_attribute(...)`, `span.end()`.  That shape needs
@@ -29,6 +27,8 @@
 // caller's behalf — `duplicate_keys` reports instead.
 //
 // NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+use trctx
 
 // What kind of thing the span measured.
 //
@@ -149,7 +149,9 @@ pub struct TrSpan
 // ```
 pub fn start(name: Str, kind: TrSpanKind, context: TrSpanContext, parent: ?TrSpanContext,
              start_unix: Float) -> TrSpan []
-    todo("tracing-nv.trspan.start")
+    TrSpan { name: name, kind: kind, context: context, parent: parent,
+             start_unix: start_unix, end_unix: 0.0, attributes: [], events: [],
+             links: [], status: unset_status() }
 
 // End a span at this instant.
 //
@@ -168,7 +170,14 @@ pub fn start(name: Str, kind: TrSpanKind, context: TrSpanContext, parent: ?TrSpa
 //     println("a span, ended")
 // ```
 pub fn finish(s: TrSpan, end_unix: Float) -> TrSpan []
-    todo("tracing-nv.trspan.finish")
+    // The first end wins, so a caller that ends a span on both the
+    // success and the failure path reports the duration of the work
+    // rather than of the reporting.
+    if is_finished(s)
+        return s
+    TrSpan { name: s.name, kind: s.kind, context: s.context, parent: s.parent,
+             start_unix: s.start_unix, end_unix: end_unix, attributes: s.attributes,
+             events: s.events, links: s.links, status: s.status }
 
 // Has this span been ended?
 //
@@ -185,7 +194,7 @@ pub fn finish(s: TrSpan, end_unix: Float) -> TrSpan []
 //     println("whether a span was ended")
 // ```
 pub fn is_finished(s: TrSpan) -> Bool []
-    todo("tracing-nv.trspan.is_finished")
+    s.end_unix != 0.0
 
 // How long the span took, in seconds, or `0.0` if it has not ended.
 //
@@ -199,7 +208,26 @@ pub fn is_finished(s: TrSpan) -> Bool []
 //     println("a span's duration")
 // ```
 pub fn duration_seconds(s: TrSpan) -> Float []
-    todo("tracing-nv.trspan.duration_seconds")
+    // Zero rather than an optional, so a duration is arithmetic at every
+    // call site; `is_finished` is the question that separates "no time
+    // passed" from "nothing was measured".
+    if not is_finished(s)
+        return 0.0
+    s.end_unix - s.start_unix
+
+// rebuilt is a span with new lists and a new status, which is all any
+// `with_*` call changes: the identity, the instants and the parent are
+// copied from the span it is given.
+//
+// Every list a `with_*` builds is a NEW list — `list.concat` rather than
+// `list.push` — because a struct's list field is shared with every copy
+// of the span, and a span that grew an event would grow it on the
+// caller's copy too.
+fn rebuilt(s: TrSpan, attributes: [TrAttr], events: [TrEvent], links: [TrLink],
+           status: TrStatus) -> TrSpan []
+    TrSpan { name: s.name, kind: s.kind, context: s.context, parent: s.parent,
+             start_unix: s.start_unix, end_unix: s.end_unix, attributes: attributes,
+             events: events, links: links, status: status }
 
 // The span with one more attribute.
 //
@@ -213,7 +241,9 @@ pub fn duration_seconds(s: TrSpan) -> Float []
 //     println("a span, tagged")
 // ```
 pub fn with_attr(s: TrSpan, a: TrAttr) -> TrSpan []
-    todo("tracing-nv.trspan.with_attr")
+    // Through the list form rather than beside it, so a span tagged in a
+    // loop and a span tagged once take the same path.
+    with_attrs(s, [a])
 
 // The span with these attributes appended.
 //
@@ -227,7 +257,10 @@ pub fn with_attr(s: TrSpan, a: TrAttr) -> TrSpan []
 //     println("a span, tagged several times")
 // ```
 pub fn with_attrs(s: TrSpan, attrs: [TrAttr]) -> TrSpan []
-    todo("tracing-nv.trspan.with_attrs")
+    if list.len(attrs) == 0
+        return s
+    let merged = list.concat(s.attributes, attrs)
+    rebuilt(s, merged, s.events, s.links, s.status)
 
 // The span with one more event.
 //
@@ -241,7 +274,8 @@ pub fn with_attrs(s: TrSpan, attrs: [TrAttr]) -> TrSpan []
 //     println("a span, with something noted inside it")
 // ```
 pub fn with_event(s: TrSpan, e: TrEvent) -> TrSpan []
-    todo("tracing-nv.trspan.with_event")
+    let added = list.concat(s.events, [e])
+    rebuilt(s, s.attributes, added, s.links, s.status)
 
 // The span with one more causal link.
 //
@@ -255,7 +289,8 @@ pub fn with_event(s: TrSpan, e: TrEvent) -> TrSpan []
 //     println("a span, linked to another trace")
 // ```
 pub fn with_link(s: TrSpan, l: TrLink) -> TrSpan []
-    todo("tracing-nv.trspan.with_link")
+    let added = list.concat(s.links, [l])
+    rebuilt(s, s.attributes, s.events, added, s.status)
 
 // The span with this status.
 //
@@ -269,7 +304,7 @@ pub fn with_link(s: TrSpan, l: TrLink) -> TrSpan []
 //     println("a span, marked failed")
 // ```
 pub fn with_status(s: TrSpan, st: TrStatus) -> TrSpan []
-    todo("tracing-nv.trspan.with_status")
+    rebuilt(s, s.attributes, s.events, s.links, st)
 
 // The span with an exception recorded as the specification's event.
 //
@@ -296,7 +331,18 @@ pub fn with_status(s: TrSpan, st: TrStatus) -> TrSpan []
 // ```
 pub fn record_exception(s: TrSpan, kind: Str, message: Str, stacktrace: Str,
                         at_unix: Float) -> TrSpan []
-    todo("tracing-nv.trspan.record_exception")
+    // `exception.type` is always written, even when the caller has no
+    // name for it: the key is what tells a backend this event is an
+    // exception at all, and an empty one is still that fact.
+    var attrs: [TrAttr] = [attr_str("exception.type", kind)]
+    if message != ""
+        attrs = list.push(attrs, attr_str("exception.message", message))
+    // An absent stacktrace is left off rather than written empty, which
+    // is the specification's own rule: an attribute carrying nothing is
+    // a value a backend has to decide about, and there is no decision.
+    if stacktrace != ""
+        attrs = list.push(attrs, attr_str("exception.stacktrace", stacktrace))
+    with_event(s, event("exception", at_unix, attrs))
 
 // An event.
 //
@@ -307,7 +353,7 @@ pub fn record_exception(s: TrSpan, kind: Str, message: Str, stacktrace: Str,
 //     println(trspan.event("cache.miss", 1757548800.2, []).name)
 // ```
 pub fn event(name: Str, at_unix: Float, attributes: [TrAttr]) -> TrEvent []
-    todo("tracing-nv.trspan.event")
+    TrEvent { name: name, at_unix: at_unix, attributes: attributes }
 
 // A link to a span in another trace.
 //
@@ -321,7 +367,7 @@ pub fn event(name: Str, at_unix: Float, attributes: [TrAttr]) -> TrEvent []
 //     println("a causal edge to another trace")
 // ```
 pub fn link(context: TrSpanContext, attributes: [TrAttr]) -> TrLink []
-    todo("tracing-nv.trspan.link")
+    TrLink { context: context, attributes: attributes }
 
 // An attribute whose value is text.
 //
@@ -332,7 +378,7 @@ pub fn link(context: TrSpanContext, attributes: [TrAttr]) -> TrLink []
 //     println(trspan.attr_str("http.method", "GET").key)
 // ```
 pub fn attr_str(key: Str, v: Str) -> TrAttr []
-    todo("tracing-nv.trspan.attr_str")
+    TrAttr { key: key, value: TrvStr(v) }
 
 // An attribute whose value is a whole number.
 //
@@ -343,7 +389,7 @@ pub fn attr_str(key: Str, v: Str) -> TrAttr []
 //     println(trspan.attr_int("http.status_code", 200).key)
 // ```
 pub fn attr_int(key: Str, v: Int) -> TrAttr []
-    todo("tracing-nv.trspan.attr_int")
+    TrAttr { key: key, value: TrvInt(v) }
 
 // An attribute whose value is a real number.
 //
@@ -354,7 +400,7 @@ pub fn attr_int(key: Str, v: Int) -> TrAttr []
 //     println(trspan.attr_float("db.duration_ms", 12.5).key)
 // ```
 pub fn attr_float(key: Str, v: Float) -> TrAttr []
-    todo("tracing-nv.trspan.attr_float")
+    TrAttr { key: key, value: TrvFloat(v) }
 
 // An attribute whose value is true or false.
 //
@@ -365,7 +411,7 @@ pub fn attr_float(key: Str, v: Float) -> TrAttr []
 //     println(trspan.attr_bool("http.request.resend", false).key)
 // ```
 pub fn attr_bool(key: Str, v: Bool) -> TrAttr []
-    todo("tracing-nv.trspan.attr_bool")
+    TrAttr { key: key, value: TrvBool(v) }
 
 // The unset status, which is what a span starts with.
 //
@@ -376,7 +422,7 @@ pub fn attr_bool(key: Str, v: Bool) -> TrAttr []
 //     println("${trspan.unset_status().code == TrUnset}")
 // ```
 pub fn unset_status() -> TrStatus []
-    todo("tracing-nv.trspan.unset_status")
+    TrStatus { code: TrUnset, description: "" }
 
 // The ok status, which only an application sets.
 //
@@ -387,7 +433,10 @@ pub fn unset_status() -> TrStatus []
 //     println("${trspan.ok_status().code == TrOk}")
 // ```
 pub fn ok_status() -> TrStatus []
-    todo("tracing-nv.trspan.ok_status")
+    // No description: the specification says the text is only meaningful
+    // on an error, and a backend drops it from an `ok` — so writing one
+    // would be writing something nobody will ever read.
+    TrStatus { code: TrOk, description: "" }
 
 // The error status, with the description a backend shows.
 //
@@ -398,7 +447,7 @@ pub fn ok_status() -> TrStatus []
 //     println(trspan.error_status("upstream timed out").description)
 // ```
 pub fn error_status(description: Str) -> TrStatus []
-    todo("tracing-nv.trspan.error_status")
+    TrStatus { code: TrError, description: description }
 
 // The value of the first attribute under this key, or `None`.
 //
@@ -412,7 +461,12 @@ pub fn error_status(description: Str) -> TrStatus []
 //     println("an attribute, looked up")
 // ```
 pub fn attr_of(s: TrSpan, key: Str) -> ?TrAttrValue []
-    todo("tracing-nv.trspan.attr_of")
+    // The FIRST match, so a duplicate key at least answers the same way
+    // twice; `duplicate_keys` is how the caller finds out there was one.
+    for a in s.attributes
+        if a.key == key
+            return Some(a.value)
+    None
 
 // Every attribute key this span carries more than once.
 //
@@ -433,7 +487,24 @@ pub fn attr_of(s: TrSpan, key: Str) -> ?TrAttrValue []
 //     println("the attribute keys written twice")
 // ```
 pub fn duplicate_keys(s: TrSpan) -> [Str] []
-    todo("tracing-nv.trspan.duplicate_keys")
+    var found: [Str] = []
+    for i in 0..list.len(s.attributes)
+        let key = s.attributes[i].key
+        // An earlier occurrence rather than a later one, so the answer
+        // is the key's first position and does not depend on the order
+        // the span was built in.
+        var earlier = false
+        for j in 0..i
+            if s.attributes[j].key == key
+                earlier = true
+        // Once per key, however many times it was written.
+        var reported = false
+        for f in found
+            if f == key
+                reported = true
+        if earlier and not reported
+            found = list.push(found, key)
+    found
 
 // The span kind as the word the OTLP encoding uses.
 //
@@ -444,4 +515,9 @@ pub fn duplicate_keys(s: TrSpan) -> [Str] []
 //     println(trspan.kind_name(TrServer))
 // ```
 pub fn kind_name(k: TrSpanKind) -> Str []
-    todo("tracing-nv.trspan.kind_name")
+    match k
+        TrInternal => "internal"
+        TrClient   => "client"
+        TrServer   => "server"
+        TrProducer => "producer"
+        TrConsumer => "consumer"

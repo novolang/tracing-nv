@@ -1,0 +1,785 @@
+// tracing_nv_edge_tests.nv — the arms the eight specification suites
+// leave standing: the empty batch, the negative slot, the ratio out of
+// range, the field under a trace key that is not text, the sink that
+// refuses, and the socket a collector would answer on.
+//
+// WHY A SUITE FOR THE EDGES.  The eight suites published beside this one
+// assert what a call ANSWERS — the header layout, the sampling rule,
+// the nesting of the document.  What they do not ask is what a body does
+// when there is nothing to answer: an empty batch is never due, a slot
+// of -1 is ignored rather than a panic, a ratio of 2.0 means keep
+// everything, and a collector that says nothing is a fault rather than a
+// success.  Every one of those has an answer written into `src/`, and an
+// answer nobody calls is an answer nobody has read twice.
+//
+// THE SOCKET CASES RUN, ON LOOPBACK.  `net.listen_on("127.0.0.1", 0)` is
+// a server the rest of the network cannot reach on a port nothing else
+// can be using, and the deadline is a fraction of a second — so a real
+// connection, a real request and a real timeout are asserted with no
+// collector and no network in the room.
+//
+// WHAT IT CANNOT REACH IS MARKED IN `src/`.  A collector that ANSWERS
+// cannot be simulated from one thread: the test would have to accept and
+// write while `trotlp.send` sits in `recv`.  That region carries a
+// `cov: skip` marker with its reason beside it.
+
+use std.test
+use std.list
+use std.str
+use lgrecord
+use lgfilter
+use lgsink
+use trctx
+use trexport
+use trid
+use trlog
+use trotlp
+use trprop
+use trsample
+use trspan
+
+// a_context is the specification's own example context, which the cases
+// below assert against by id.
+fn a_context() -> TrSpanContext
+    trctx.span_context("4bf92f3577b34da6a3ce929d0e0e4736",
+                       "00f067aa0ba902b7", 1, "", false)
+
+// a_span is one finished server span.
+fn a_span(name: Str) -> TrSpan
+    trspan.finish(
+        trspan.start(name, TrServer, a_context(), None, 1757548800.0),
+        1757548800.5)
+
+// an_unsampled_span is one whose context says it was never meant to
+// travel, which is the push a batch must not count as lost.
+fn an_unsampled_span() -> TrSpan
+    trspan.finish(
+        trspan.start("dropped", TrServer,
+                     trctx.span_context("4bf92f3577b34da6a3ce929d0e0e4736",
+                                        "00f067aa0ba902b7", 0, "", false),
+                     None, 1757548800.0),
+        1757548800.5)
+
+// a_record is one log line at the level the crossing cases use.
+fn a_record() -> LgRecord
+    lgrecord.record(LgInfo, "http.server", "request served")
+
+// queued is one span in a batch with the default limits.
+fn queued(name: Str) -> TrBatch
+    trexport.push(trexport.batch(trexport.default_limits()), a_span(name), 1757548800.0)
+
+// ship is the whole export of a batch, charged the row the exporter
+// declares.
+fn ship(b: TrBatch, x: TrMemoryExporter) -> (TrExportOutcome, TrBatch) [mutate]
+    trexport.flush_into(b, x)
+
+// kept is what an in-memory exporter holds, which is `[mutate]` because
+// the slot is state the exporter shares with its caller.
+fn kept(x: TrMemoryExporter) -> [TrSpan] [mutate]
+    trexport.exported_spans(x)
+
+// has_named says whether a slot holds a span of this name — the
+// assertion that does not depend on nothing else having written to the
+// slot.
+fn has_named(spans: [TrSpan], name: Str) -> Bool
+    for s in spans
+        if s.name == name
+            return true
+    false
+
+// entries is a `tracestate` of n vendor entries, each long enough that
+// thirty of them are over the header's character limit.
+fn entries(n: Int) -> Str []
+    let parts = list.map(list.range(0, n), i => "k" + str.from_int(i) + "=" + str.repeat("v", 20))
+    str.join(parts, ",")
+
+// over_cap is one span more than the default batch size, for the case
+// that refuses a batch rather than truncating it.
+fn over_cap() -> [TrSpan]
+    list.map(list.range(0, 513), _i => a_span("GET /users"))
+
+// keep_writes is a sampler a caller writes and names, which is the arm
+// `trsample.sampler` exists for.
+fn keep_writes(p: TrSamplingParams) -> TrSamplingResult
+    trsample.result(TrRecordAndSample, [], "")
+
+// A sink that refuses every record, so the fault arm of the generic
+// emits is callable without a transport that has to fail on request.
+// Two fields, because a struct with none is a parse error.
+struct RefusingSink
+    min: LgLevel
+
+impl LgSink[] for RefusingSink
+    fn emit(self, r: LgRecord) -> Result<Unit, LgSinkFault> []
+        Err(LgSinkClosed)
+
+    fn flush(self) -> Result<Unit, LgSinkFault> []
+        Err(LgSinkClosed)
+
+    fn accepts(self, l: LgLevel) -> Bool []
+        true
+
+fn refusing() -> RefusingSink
+    RefusingSink { min: LgTrace }
+
+// ── trsample ────────────────────────────────────────────────────────
+
+@test
+fn test_a_ratio_out_of_range_clamps_rather_than_refusing() [io]
+    let id = "4bf92f3577b34da6a3ce929d0e0e4736"
+    let ask = trsample.params(None, id, "GET /users", TrServer, [], [])
+
+    test.case("a ratio below zero is configuration meaning keep nothing")
+    let nothing = trsample.decide(trsample.trace_id_ratio(-1.0), ask)
+    test.assert(not trsample.is_exported(nothing.decision))
+
+    test.case("and above one means keep everything, rather than failing at startup")
+    let everything = trsample.decide(trsample.trace_id_ratio(2.0), ask)
+    test.assert(trsample.is_exported(everything.decision))
+
+@test
+fn test_a_trace_id_that_is_not_hex_is_skipped_rather_than_folded_in() [io]
+    let s = trsample.trace_id_ratio(0.5)
+    let ask = trsample.params(None, "not a hex id at all!!", "GET /users", TrServer, [], [])
+
+    test.case("the answer is a decision, not a fault: an id from a broken caller still decides")
+    let first = trsample.decide(s, ask)
+
+    test.case("and it is the same decision twice, which is what passing over the bad bytes buys")
+    let again = trsample.decide(s, ask)
+    test.assert(first.decision == again.decision)
+
+@test
+fn test_a_sampler_a_caller_names_keeps_its_name_and_its_rule() [io]
+    let s = trsample.sampler("writes-only", keep_writes)
+
+    test.case("the name goes into the startup line and the resource attributes")
+    test.assert(s.name == "writes-only")
+
+    test.case("and the function the caller wrote is what decides")
+    let d = trsample.decide(s, trsample.params(None, "4bf92f3577b34da6a3ce929d0e0e4736",
+                                               "SELECT", TrClient, [], []))
+    test.assert(trsample.is_exported(d.decision))
+
+// ── trctx ───────────────────────────────────────────────────────────
+
+@test
+fn test_a_context_keeps_the_baggage_it_is_not_dropping() [io]
+    let both = trctx.with_baggage(
+        trctx.with_baggage(trctx.empty(), "tenant", "acme", ""), "user", "u1", "")
+    let kept_one = trctx.without_baggage(both, "tenant")
+
+    test.case("the entry that was not named is still there")
+    test.assert(trctx.baggage_of(kept_one, "user") == Some("u1"))
+
+    test.case("and the one that was is gone")
+    test.assert(trctx.baggage_of(kept_one, "tenant") == None)
+
+@test
+fn test_an_id_that_is_not_lowercase_hex_of_the_right_length_is_not_valid() [io]
+    test.case("uppercase is what a proxy that rewrites headers sends, and a backend matches lowercase")
+    test.assert(not trctx.is_valid(trctx.span_context("4BF92F3577B34DA6A3CE929D0E0E4736",
+                                                      "00f067aa0ba902b7", 1, "", false)))
+
+    test.case("a character that is not hex at all")
+    test.assert(not trctx.is_valid(trctx.span_context("4bf92f3577b34da6a3ce929d0e0e473z",
+                                                      "00f067aa0ba902b7", 1, "", false)))
+
+    test.case("and a trace id one character short, which is the truncating proxy")
+    test.assert(not trctx.is_valid(trctx.span_context("4bf92f3577b34da6a3ce929d0e0e473",
+                                                      "00f067aa0ba902b7", 1, "", false)))
+
+// ── trspan ──────────────────────────────────────────────────────────
+
+@test
+fn test_an_exception_keeps_its_stacktrace_when_it_has_one() [io]
+    let bare = trspan.record_exception(a_span("boot"), "ConfigError", "", "", 1757548800.2)
+    let full = trspan.record_exception(a_span("boot"), "ConfigError", "no such key",
+                                       "at config.nv:41", 1757548800.2)
+
+    test.case("the type is written even with no message, because that is what marks the event an exception")
+    test.assert(list.len(bare.events[0].attributes) == 1)
+
+    test.case("a stacktrace is a third attribute when the caller has one")
+    test.assert(list.len(full.events[0].attributes) == 3)
+
+@test
+fn test_looking_for_an_attribute_that_is_not_there() [io]
+    test.case("an empty answer rather than a zero value, so 'not set' stays distinguishable")
+    test.assert(trspan.attr_of(a_span("GET /users"), "http.status_code") == None)
+
+@test
+fn test_a_key_written_three_times_is_reported_once() [io]
+    let once = trspan.with_attr(a_span("GET /users"), trspan.attr_int("retry", 1))
+    let twice = trspan.with_attr(once, trspan.attr_int("retry", 2))
+    let thrice = trspan.with_attr(twice, trspan.attr_int("retry", 3))
+
+    test.case("one key, however many times it was written")
+    test.assert(list.len(trspan.duplicate_keys(thrice)) == 1)
+
+    test.case("and the first value is the one a lookup answers, so a read is stable")
+    test.assert(trspan.attr_of(thrice, "retry") == Some(TrvInt(1)))
+
+// ── trlog ───────────────────────────────────────────────────────────
+
+@test
+fn test_a_field_under_a_trace_key_that_is_not_text_names_no_trace() [io]
+    let wrong = lgrecord.with_field(a_record(),
+                                    lgrecord.field_int(trlog.trace_id_key(), 40000))
+
+    test.case("a record with an integer under trace_id has a key and no trace")
+    test.assert(trlog.trace_id_of(wrong) == None)
+
+    test.case("so it is NOT correlated, which is what lets a handler add the correlation that fixes it")
+    test.assert(not trlog.is_correlated(wrong))
+
+@test
+fn test_a_level_that_is_not_a_level_is_information() [io]
+    test.case("a token nobody can read a level off is not a warning")
+    let token = trlog.record_of_event(
+        trspan.event("retry", 1757548800.2, [trspan.attr_str("level", "banana")]),
+        a_context(), "app")
+    test.assert(token.level == LgInfo)
+
+    test.case("and a value that is not text under that key names no level either")
+    let number = trlog.record_of_event(
+        trspan.event("retry", 1757548800.2, [trspan.attr_int("level", 3)]),
+        a_context(), "app")
+    test.assert(number.level == LgInfo)
+
+@test
+fn test_list_valued_attributes_cross_as_text_rather_than_vanishing() [io]
+    let e = trspan.event("cache.miss", 1757548800.2,
+                         [TrAttr { key: "keys", value: TrvStrList(["a", "b"]) },
+                          TrAttr { key: "rows", value: TrvIntList([1, 2]) },
+                          TrAttr { key: "flags", value: TrvBoolList([true, false]) },
+                          trspan.attr_str("path", "/users"),
+                          trspan.attr_int("status", 200),
+                          trspan.attr_float("took", 0.5),
+                          trspan.attr_bool("reused", true)])
+    let r = trlog.record_of_event(e, a_context(), "app")
+
+    test.case("an array has no logging-nv value type, so it arrives as text — a field that vanished is worse")
+    test.assert(lgrecord.field_of(r, "keys") == Some(LgvStr("[a,b]")))
+    test.assert(lgrecord.field_of(r, "rows") == Some(LgvStr("[1,2]")))
+    test.assert(lgrecord.field_of(r, "flags") == Some(LgvStr("[true,false]")))
+
+    test.case("and the scalars cross with their own types, which is what a backend aggregates on")
+    test.assert(lgrecord.field_of(r, "path") == Some(LgvStr("/users")))
+    test.assert(lgrecord.field_of(r, "status") == Some(LgvInt(200)))
+    test.assert(lgrecord.field_of(r, "took") == Some(LgvFloat(0.5)))
+    test.assert(lgrecord.field_of(r, "reused") == Some(LgvBool(true)))
+
+@test
+fn test_every_log_value_crosses_to_a_span_value() [io]
+    test.case("a string")
+    match trlog.attr_value_of(LgvStr("x"))
+        TrvStr(s) => test.assert(s == "x")
+        _         => test.assert(false)
+
+    test.case("an integer")
+    match trlog.attr_value_of(LgvInt(7))
+        TrvInt(n) => test.assert(n == 7)
+        _         => test.assert(false)
+
+    test.case("a float")
+    match trlog.attr_value_of(LgvFloat(1.5))
+        TrvFloat(x) => test.assert(x == 1.5)
+        _           => test.assert(false)
+
+    test.case("a bool")
+    match trlog.attr_value_of(LgvBool(true))
+        TrvBool(b) => test.assert(b)
+        _          => test.assert(false)
+
+    test.case("and a value that is present and empty, which OTLP has no arm for")
+    match trlog.attr_value_of(LgvNone)
+        TrvStr(text) => test.assert(text == "")
+        _            => test.assert(false)
+
+@test
+fn test_a_sink_that_refuses_stops_the_spill() [io]
+    let s = trlog.attach(trspan.start("GET /users", TrServer, a_context(), None, 1757548800.0),
+                         a_record())
+
+    test.case("the fault comes back, because writing the rest into a sink that has said no makes an outage read as a quiet hour")
+    match trlog.events_into(refusing(), lgfilter.filter(LgInfo), s)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f == LgSinkClosed)
+
+// ── trid ────────────────────────────────────────────────────────────
+
+@test
+fn test_a_tracer_can_be_attributed_to_a_scope_the_caller_names() [io]
+    let t = trid.tracer_for(trsample.always_on(), trotlp.scope("my-http-client", "1.2.0"))
+
+    test.case("the scope is the caller's, which is how a library's spans are told from the application's")
+    test.assert(t.scope.name == "my-http-client")
+    test.assert(t.scope.version == "1.2.0")
+
+    test.case("and the sampler is the one it was built with")
+    test.assert(t.sampler.name == trsample.always_on().name)
+
+@test
+fn test_the_clock_reads_after_the_epoch_and_never_backwards() [io, time]
+    let now = trid.now_unix()
+
+    test.case("a clock reading, which no other row in this package takes")
+    test.assert(now > 0.0)
+
+    test.case("and a clock that went backwards is the bug this is written down to catch")
+    test.assert(trid.now_unix() >= now)
+
+@test
+fn test_a_root_context_is_a_valid_pair_with_its_flags_clear() [io, rand]
+    let c = trid.root_context()
+
+    test.case("both ids are real, because a propagation header is built from them")
+    test.assert(trctx.is_valid(c))
+
+    test.case("and the sampled bit is clear, so a dropped root's children cannot export")
+    test.assert(not trctx.is_sampled(c))
+
+@test
+fn test_a_started_span_keeps_the_attributes_and_links_it_was_given() [io, rand]
+    let started = trid.start_span(trid.tracer(trsample.always_on()), trctx.empty(),
+                                  "GET /users", TrServer,
+                                  [trspan.attr_str("http.method", "GET")],
+                                  [trspan.link(a_context(), [])], 1757548800.0)
+
+    test.case("an attribute known at start is on the span")
+    test.assert(list.len(started.span.attributes) == 1)
+
+    test.case("and a link survives the start, because it is a causal edge and not a parent")
+    test.assert(list.len(started.span.links) == 1)
+
+@test
+fn test_a_seeded_derivation_is_frozen_and_names_real_ids() [io]
+    let (trace_id, span_id) = trid.seeded_ids(7, 3)
+
+    test.case("the ids are ones a backend would accept, not merely thirty-two characters of anything")
+    test.assert(trctx.is_valid(trctx.span_context(trace_id, span_id, 0, "", false)))
+
+    test.case("the derivation is frozen, so an assertion naming an id keeps passing next year")
+    let (again_trace, again_span) = trid.seeded_ids(7, 3)
+    test.assert(again_trace == trace_id and again_span == span_id)
+
+    test.case("a different seed is a different trace, which is what two fixtures are for")
+    let (other, _) = trid.seeded_ids(8, 3)
+    test.assert(other != trace_id)
+
+    test.case("and no word of one id repeats another")
+    test.assert(str.slice(trace_id, 0, 8) != str.slice(trace_id, 8, 16))
+
+// ── trprop ──────────────────────────────────────────────────────────
+
+@test
+fn test_the_traceparent_guards_answer_a_restart_and_a_reason() [io]
+    let id = "4bf92f3577b34da6a3ce929d0e0e4736"
+    let sid = "00f067aa0ba902b7"
+
+    test.case("version 00 is length-checked, so a fifth field is a bad shape")
+    let long_shape = trprop.extract("00-" + id + "-" + sid + "-01-extra", "")
+    test.assert(long_shape.restart)
+    test.assert(trprop.reason_message(long_shape.reason) != "")
+
+    test.case("while a later version is read for its four known fields and the rest ignored")
+    let future = trprop.extract("01-" + id + "-" + sid + "-01-extra", "")
+    test.assert(not future.restart)
+
+    test.case("flags that are not hex restart, and a flags byte whose digits are letters does not")
+    let bad_flags = trprop.extract("00-" + id + "-" + sid + "-zz", "")
+    test.assert(bad_flags.restart)
+
+    let letters = trprop.extract("00-" + id + "-" + sid + "-0a", "")
+    test.assert(letters.context.flags == 10)
+
+@test
+fn test_a_tracestate_over_a_limit_is_cut_from_the_right() [io]
+    test.case("an absent header is within the limits, which is asked before every send")
+    test.assert(trprop.state_is_valid(""))
+
+    test.case("a header over 512 characters is not")
+    test.assert(not trprop.state_is_valid(str.repeat("a", 513)))
+
+    test.case("nor one of more than 32 entries, which is a count and not a length")
+    let many = list.map(list.range(0, 33), i => "k" + str.from_int(i) + "=v")
+    test.assert(not trprop.state_is_valid(str.join(many, ",")))
+
+    test.case("nor one whose entry has no vendor key before its =")
+    test.assert(not trprop.state_is_valid("novo=1,justakey"))
+
+    test.case("and looking that entry up answers an empty value rather than failing")
+    test.assert(trprop.state_get("novo=1,justakey", "justakey") == Some(""))
+
+    test.case("a write cuts a header over the entry limit back to 32, from the right because the left is the newest")
+    let trimmed = trprop.state_set(entries(33), "acme", "1")
+    test.assert(trprop.state_is_valid(trimmed))
+
+    test.case("and cuts one over the character limit as well")
+    let shortened = trprop.state_set(entries(30), "acme", "1")
+    test.assert(str.len(shortened) <= 512)
+
+    test.case("with this vendor's own entry at the front, whatever order the rest arrive in")
+    test.assert(trprop.state_get(shortened, "acme") == Some("1"))
+
+@test
+fn test_baggage_keeps_the_properties_a_vendor_wrote() [io]
+    let c = trprop.extract_baggage(trctx.empty(), "tenant=acme;ttl=30,user=u1")
+
+    test.case("both entries parsed, the malformed ones in an absent header being none")
+    test.assert(trctx.baggage_of(c, "tenant") == Some("acme"))
+    test.assert(trprop.baggage_dropped("") == 0)
+
+    test.case("and the writer's properties come back out exactly as they arrived")
+    test.assert(trprop.inject_baggage(c) == "tenant=acme;ttl=30,user=u1")
+
+    test.case("an entry that will not parse is counted rather than silently dropped")
+    test.assert(trprop.baggage_dropped("=acme,novalue") == 2)
+
+@test
+fn test_every_reason_reads_as_its_own_line_for_an_operator() [io]
+    let reasons = [TrPropOk,
+                   TrPropAbsent,
+                   TrPropReservedVersion,
+                   TrPropFutureVersion("01"),
+                   TrPropBadShape(3),
+                   TrPropBadField("span-id"),
+                   TrPropZeroId("trace-id")]
+
+    test.case("every arm says something, because an empty line is a count nobody can read")
+    var silent = 0
+    for r in reasons
+        if trprop.reason_message(r) == ""
+            silent = silent + 1
+    test.assert(silent == 0)
+
+    test.case("and no two arms read the same, because an operator grouping by this text is counting the arms")
+    var same = 0
+    for i in 0..list.len(reasons)
+        for j in 0..list.len(reasons)
+            if i != j
+                if trprop.reason_message(reasons[j]) == trprop.reason_message(reasons[i])
+                    same = same + 1
+    test.assert(same == 0)
+
+@test
+fn test_an_invalid_context_injects_the_all_zero_header_rather_than_nothing() [io]
+    test.case("a downstream service that receives nothing and one that receives an invalid header behave differently")
+    test.assert(trprop.inject_traceparent(trctx.invalid_context()) ==
+                "00-" + trctx.invalid_trace_id() + "-" + trctx.invalid_span_id() + "-00")
+
+// ── trexport ────────────────────────────────────────────────────────
+
+@test
+fn test_a_memory_exporter_keeps_the_newest_spans_and_counts_the_ones_it_dropped() [io]
+    let x = trexport.memory_exporter(71, 2)
+
+    test.case("an empty batch touches nothing and answers nothing sent")
+    test.assert(x.export([]).sent == 0)
+
+    let (first, _) = ship(queued("one"), x)
+    let (second, _) = ship(queued("two"), x)
+
+    test.case("a slot that has never been written reads empty rather than faulting")
+    test.assert(first.sent == 1)
+    test.assert(second.dropped == 0)
+
+    let (third, _) = ship(queued("three"), x)
+
+    test.case("two spans were kept, because the cap is two")
+    test.assert(list.len(kept(x)) == 2)
+
+    test.case("the newest are the ones kept, which is what the cap's own comment says")
+    test.assert(has_named(kept(x), "three"))
+    test.assert(not has_named(kept(x), "one"))
+
+    test.case("the third export dropped one span, and the count is on the outcome")
+    test.assert(third.dropped == 1)
+
+    test.case("and the outcome is not clean, because a drop is a drop even with no fault")
+    test.assert(not trexport.outcome_is_clean(third))
+
+@test
+fn test_a_slot_that_is_not_a_slot_number_is_ignored_rather_than_fatal() [io]
+    let x = trexport.memory_exporter(-1, 8)
+
+    test.case("the export answers, and nothing is written anywhere")
+    let (out, _) = ship(queued("one"), x)
+    test.assert(out.sent == 1)
+
+    test.case("and reading it back is empty rather than a fault")
+    test.assert(list.len(kept(x)) == 0)
+
+    test.case("while flush and shutdown have nothing to push, and say so")
+    test.assert(x.flush().fault == None)
+    test.assert(x.shutdown().fault == None)
+
+@test
+fn test_a_slot_shared_by_two_exporters_never_answers_a_negative_count() [io]
+    let big = trexport.memory_exporter(72, 3)
+    let small = trexport.memory_exporter(72, 1)
+    ship(queued("one"), big)
+    ship(queued("two"), big)
+    ship(queued("three"), big)
+
+    test.case("the smaller cap drops what the larger one kept")
+    let (out, _) = ship(queued("four"), small)
+
+    test.case("a sent count is never negative, however much the cap dropped")
+    test.assert(out.sent == 0)
+    test.assert(out.dropped == 3)
+
+@test
+fn test_clearing_a_slot_empties_it_and_a_slot_that_is_not_one_is_ignored() [io]
+    let x = trexport.memory_exporter(74, 16)
+    ship(queued("one"), x)
+    ship(queued("two"), x)
+
+    test.case("the exports are there to be read, which is what makes the clear worth having")
+    test.assert(list.len(kept(x)) == 2)
+
+    test.case("and after the clear the slot reads the way a slot nothing has written does")
+    trexport.clear_slot(74)
+    test.assert(list.len(kept(x)) == 0)
+
+    test.case("clearing a slot nothing has written is not a fault")
+    trexport.clear_slot(75)
+    test.assert(list.len(kept(trexport.memory_exporter(75, 16))) == 0)
+
+    test.case("and a negative slot is ignored here as it is everywhere else: a written slot is untouched")
+    ship(queued("three"), x)
+    trexport.clear_slot(-1)
+    test.assert(list.len(kept(x)) == 1)
+
+@test
+fn test_an_empty_batch_is_never_due_and_a_due_one_is_sent_by_its_own_call() [io]
+    let limits = trexport.limits(4, 2.0, 64)
+    let empty = trexport.batch(limits)
+
+    test.case("empty, however long it has been empty: a loop would otherwise send a request per iteration")
+    test.assert(not trexport.should_flush(empty, 1757548800.0))
+
+    let one = trexport.push(empty, a_span("one"), 1757548800.0)
+    let two = trexport.push(one, a_span("two"), 1757548800.0)
+    let three = trexport.push(two, a_span("three"), 1757548800.0)
+    let four = trexport.push(three, a_span("four"), 1757548800.0)
+
+    test.case("full: a batch at its limit is due however young it is")
+    test.assert(trexport.should_flush(four, 1757548800.0))
+
+    test.case("and a quiet one is due when its delay has passed, which is >= because two seconds means two")
+    test.assert(trexport.should_flush(one, 1757548802.0))
+    test.assert(not trexport.should_flush(one, 1757548801.9))
+
+    test.case("the loop's own call leaves a batch that is not due alone")
+    let x = trexport.memory_exporter(73, 16)
+    let (untouched, still_empty) = trexport.flush_if_due(empty, x, 1757548800.0)
+    test.assert(untouched.sent == 0)
+    test.assert(list.len(still_empty.spans) == 0)
+
+    test.case("and sends a due one, emptying it")
+    let (sent, after) = trexport.flush_if_due(four, x, 1757548800.0)
+    test.assert(sent.sent == 4)
+    test.assert(list.len(after.spans) == 0)
+    test.assert(list.len(kept(x)) == 4)
+
+@test
+fn test_a_full_queue_drops_and_counts_rather_than_growing() [io]
+    let limits = trexport.limits(8, 5.0, 2)
+    let one = trexport.push(trexport.batch(limits), a_span("one"), 1757548800.0)
+    let two = trexport.push(one, a_span("two"), 1757548800.0)
+    let three = trexport.push(two, a_span("three"), 1757548800.0)
+
+    test.case("the span past the queue's limit is not queued")
+    test.assert(list.len(three.spans) == 2)
+
+    test.case("and it is counted, because the bound loses data on purpose")
+    test.assert(three.dropped == 1)
+
+@test
+fn test_an_unsampled_span_is_not_queued_and_not_counted_as_lost() [io]
+    let limits = trexport.limits(8, 5.0, 2)
+    let not_queued = trexport.push(trexport.batch(limits), an_unsampled_span(), 1757548800.0)
+
+    test.case("a span that was never meant to travel is not queued")
+    test.assert(list.len(not_queued.spans) == 0)
+
+    test.case("and it is not counted as lost, because a drop count that included it would report sampling as a fault")
+    test.assert(not_queued.dropped == 0)
+
+// ── trotlp ──────────────────────────────────────────────────────────
+
+@test
+fn test_the_exporter_over_off_is_the_pipeline_with_no_request() [io, net]
+    let x = trotlp.with_timeout(trotlp.exporter("off", trotlp.resource("checkout", [])), 0.2)
+
+    test.case("an empty batch is answered without even encoding a document")
+    test.assert(x.export([]).fault == None)
+
+    test.case("a batch with a span in it is answered too, because the endpoint is off")
+    let sent = x.export([a_span("GET /users")])
+    test.assert(sent.sent == 0)
+    test.assert(sent.fault == None)
+
+    test.case("a batch over the cap is refused by name, and the caller is told to split rather than repeat it")
+    let too_many = x.export(over_cap())
+    test.assert(too_many.sent == 0)
+    test.assert(too_many.dropped == 513)
+    match too_many.fault
+        Some(f) =>
+            test.assert(str.contains(f.message(), "513"))
+            test.assert(not trexport.is_retryable(f))
+        None    => test.assert(false)
+
+    test.case("flush and shutdown have nothing to send, because nothing is held back")
+    test.assert(x.flush().fault == None)
+    test.assert(x.shutdown().fault == None)
+
+@test
+fn test_a_collector_that_is_not_listening_is_unreachable_rather_than_a_panic() [io, net]
+    let listening = net.listen_on("127.0.0.1", 0)
+    match listening
+        Some(server) =>
+            let port = net.local_port(server)
+            net.close(server)
+            let out = trotlp.send("http://127.0.0.1:" + str.from_int(port), "{}", 0.2)
+
+            test.case("no connection, so the fault names the host and the deadline")
+            test.assert(out.sent == 0)
+            match out.fault
+                Some(f) => test.assert(trexport.is_retryable(f))
+                None    => test.assert(false)
+
+        None         => test.assert(false)
+
+@test
+fn test_a_collector_that_never_answers_is_a_fault_rather_than_a_hang() [io, net]
+    let listening = net.listen_on("127.0.0.1", 0)
+    match listening
+        Some(server) =>
+            let collector = "http://127.0.0.1:" + str.from_int(net.local_port(server))
+            let x = trotlp.with_timeout(trotlp.exporter(collector, trotlp.resource("checkout", [])), 0.2)
+
+            test.case("the document is written, and the collector says nothing back in time")
+            let out = x.export([a_span("GET /users")])
+            test.assert(out.sent == 0)
+            match out.fault
+                Some(f) => test.assert(str.contains(f.message(), "answered nothing"))
+                None    => test.assert(false)
+
+            test.case("and a deadline of zero is floored at a second rather than waiting forever")
+            let floored = trotlp.send(collector, "{}", 0.0)
+            test.assert(floored.sent == 0)
+            test.assert(floored.fault != None)
+
+            net.close(server)
+
+        None         => test.assert(false)
+
+@test
+fn test_an_endpoint_that_is_not_an_http_url_says_why_rather_than_looking_it_up() [io, net]
+    test.case("a URL in a scheme this exporter does not speak")
+    test.assert(trotlp.send("https://collector.example:4318", "{}", 0.2).fault != None)
+
+    test.case("something that is not a URL at all")
+    test.assert(trotlp.send("collector.example", "{}", 0.2).fault != None)
+
+    test.case("a URL that names no host")
+    test.assert(trotlp.send("http://", "{}", 0.2).fault != None)
+
+    test.case("and a port that is not a number")
+    test.assert(trotlp.send("http://127.0.0.1:notaport", "{}", 0.2).fault != None)
+
+    test.case("and a trailing slash, which is a base URL with no route of its own")
+    let listening = net.listen_on("127.0.0.1", 0)
+    match listening
+        Some(server) =>
+            let port = net.local_port(server)
+            net.close(server)
+            test.assert(trotlp.send("http://127.0.0.1:" + str.from_int(port) + "/", "{}", 0.2).fault != None)
+        None         => test.assert(false)
+
+@test
+fn test_the_environment_names_the_endpoint_and_the_service() [io]
+    test.case("a URL, or the word off, and never an empty string")
+    test.assert(trotlp.endpoint_from_env() != "")
+    test.assert(trotlp.service_from_env() != "")
+
+    test.case("and off is a spelling rather than a prefix, so a host called offline is still a URL")
+    test.assert(trotlp.is_disabled(" off "))
+    test.assert(not trotlp.is_disabled("offline.example:4318"))
+
+@test
+fn test_the_json_escaper_handles_what_a_value_can_carry() [io]
+    let quote = "\""
+    let backslash = "\\"
+    let value = "a" + quote + "b" + backslash + "c"
+    let doc = trotlp.encode_attr(trspan.attr_str("k", value))
+
+    test.case("a quote inside a value is escaped rather than ending the string it sits in")
+    test.assert(str.contains(doc, "\\\""))
+
+    test.case("and so is a backslash, which would otherwise escape the byte after it")
+    test.assert(str.contains(doc, "\\\\"))
+
+    test.case("a tab and a newline take their short forms, which every JSON reader unescapes")
+    let short = trotlp.encode_attr(trspan.attr_str("k", "\t" + "\n"))
+    test.assert(str.contains(short, "\\t"))
+    test.assert(str.contains(short, "\\n"))
+
+    test.case("the other three short forms as well")
+    let others = trotlp.encode_attr(trspan.attr_str("k", "\b" + "\f" + "\r"))
+    test.assert(str.contains(others, "\\b"))
+    test.assert(str.contains(others, "\\f"))
+    test.assert(str.contains(others, "\\r"))
+
+    test.case("and a control byte with no short form becomes its \\u00 escape, which is what keeps the document valid")
+    let escaped = trotlp.encode_attr(trspan.attr_str("k", "\u{1}"))
+    test.assert(str.contains(escaped, "\\u0001"))
+
+@test
+fn test_every_attribute_value_type_has_its_otlp_wrapper() [io]
+    test.case("an integer crosses as a STRING, because 64 bits do not survive a double")
+    test.assert(str.contains(trotlp.encode_attr(trspan.attr_int("http.status_code", 200)),
+                             "\"200\""))
+
+    test.case("a float is a JSON number, which is what a double is")
+    test.assert(str.contains(trotlp.encode_attr(trspan.attr_float("sampler.ratio", 0.5)),
+                             "doubleValue"))
+
+    test.case("a bool has no quotes, because JSON's booleans are bare")
+    test.assert(str.contains(trotlp.encode_attr(trspan.attr_bool("reused", true)),
+                             "boolValue\":true"))
+
+    test.case("an array's elements are AnyValues too, because a bare JSON scalar in that position is a document a collector cannot decode")
+    let xs = trotlp.encode_attr(TrAttr { key: "keys", value: TrvStrList(["a", "b"]) })
+    test.assert(str.contains(xs, "{\"stringValue\":\"b\"}"))
+
+    test.case("and the same for the other two element types, whose integers are strings for the same 64-bit reason")
+    let rows = trotlp.encode_attr(TrAttr { key: "rows", value: TrvIntList([1, 2]) })
+    test.assert(str.contains(rows, "{\"intValue\":\"2\"}"))
+    let flags = trotlp.encode_attr(TrAttr { key: "flags", value: TrvBoolList([true, false]) })
+    test.assert(str.contains(flags, "{\"boolValue\":false}"))
+
+@test
+fn test_a_span_carries_its_events_its_links_and_its_parent_into_the_document() [io]
+    let s = trspan.finish(
+        trspan.with_link(
+            trspan.with_event(
+                trspan.start("GET /users", TrServer, a_context(), Some(a_context()), 1757548800.0),
+                trspan.event("cache.miss", 1757548800.2, [trspan.attr_str("key", "u:1")])),
+            trspan.link(a_context(), [trspan.attr_str("rel", "follows")])),
+        1757548800.5)
+    let one = trotlp.encode_span(s)
+
+    test.case("the event is a name, a time and its attributes")
+    test.assert(str.contains(one, "cache.miss"))
+    test.assert(str.contains(one, "u:1"))
+
+    test.case("the link is another context, with its own ids and its own attributes")
+    test.assert(str.contains(one, "rel"))
+    test.assert(str.contains(one, "follows"))
+
+    test.case("and the parent is one field on the span rather than a list of its own")
+    test.assert(str.contains(one, "parentSpanId"))

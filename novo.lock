@@ -8,25 +8,16 @@ version = "0.2.2"
 hash = "21a32699485d5fe48ab52b7a4db3301fdc764ee9064f83b4fd457ee62f8792d0"
 
 [deflog-decoder]
-source = "registry"
-url = "https://registry.novo-lang.org"
-req = "^0.0.1"
-version = "0.0.1"
-hash = "c3140f40304d48b0b325d95e1af0a4302578c0e68c4ae59906ce785b54538f05"
+source = "path"
+path = "../deflog-decoder"
 
 [deflog-parser]
-source = "registry"
-url = "https://registry.novo-lang.org"
-req = "^0.0.1"
-version = "0.0.1"
-hash = "9f613d9797cc1a4d4b6bd2f620c38cec353d15f28e9d9e6480e9264d43e6fc1d"
+source = "path"
+path = "../deflog-parser"
 
 [elf-nv]
-source = "registry"
-url = "https://registry.novo-lang.org"
-req = "^0.0.1"
-version = "0.0.1"
-hash = "4bea6ac31beb24d8986ff7bea3392e8583175bcf99b2506fe873457f02768247"
+source = "path"
+path = "../elf-nv"
 
 [leb128-nv]
 source = "registry"
@@ -36,18 +27,12 @@ version = "0.1.7"
 hash = "71f3ef504785e8bb4c9d7e72151be91dcebc7e11f658552009fae7205725bd53"
 
 [logging-nv]
-source = "registry"
-url = "https://registry.novo-lang.org"
-req = "^0.0.4"
-version = "0.0.4"
-hash = "a8ff5bae29dd66d58fe403942f66f5441f0f9f5b2698a870b3661e723e25c8e6"
+source = "path"
+path = "../logging-nv"
 
 [rzcobs-nv]
-source = "registry"
-url = "https://registry.novo-lang.org"
-req = "^0.0.1"
-version = "0.0.1"
-hash = "2cf383f98a2589dc18a487eba10e7fd5a88c2c34047738f664c3f589ed098c81"
+source = "path"
+path = "../rzcobs-nv"
 
 [zigzag-nv]
 source = "registry"

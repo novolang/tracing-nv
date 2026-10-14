@@ -1,7 +1,5 @@
 // trprop.nv — W3C `traceparent` and `tracestate`, as a codec.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // A MALFORMED HEADER IS NOT AN ERROR, AND THAT IS THE LOAD-BEARING
 // DECISION IN THIS MODULE.  W3C Trace Context § 3.2.2.3 is explicit: a
 // receiver that cannot parse `traceparent` MUST restart the trace — mint
@@ -32,6 +30,8 @@
 // `ff` is the one reserved value and is invalid.
 //
 // NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+use trctx
 
 // What came out of a header.
 //
@@ -76,6 +76,175 @@ pub enum TrPropReason
     // is misconfigured rather than a transport fault.
     TrPropZeroId(field: Str)
 
+// is_hex_byte is whether a byte is one of the sixteen lowercase hex
+// digits.  Lowercase only, and that is the specification's rule rather
+// than a preference: `traceparent` is compared as text by middleboxes
+// and a backend matching `4BF9…` against `4bf9…` finds nothing.
+fn is_hex_byte(b: Int) -> Bool []
+    b >= '0' and b <= '9' or b >= 'a' and b <= 'f'
+
+// hex_value is the value of one such digit, or -1 for anything else.
+fn hex_value(b: Int) -> Int []
+    if b >= '0' and b <= '9'
+        return b - '0'
+    if b >= 'a' and b <= 'f'
+        return b - 'a' + 10
+    // cov: skip — the one caller, `flags_value`, runs only after
+    // `is_hex_run` has accepted the same two bytes, and its own fallback
+    // byte is `0`; a byte that is not a digit cannot arrive.  The arm is
+    // here because the function is total, the way `trsample`'s twin
+    // documents, and its twin IS reached — through a trace id, which
+    // nothing has checked.
+    -1
+
+// is_hex_run is a field of exactly this width made of lowercase hex
+// digits, zeroes included.
+fn is_hex_run(s: Str, width: Int) -> Bool []
+    if str.len(s) != width
+        return false
+    for i in 0..width
+        if not is_hex_byte(str.byte_at_or(s, i, 0))
+            return false
+    true
+
+// is_all_zero is whether a string is nothing but the character `0`.
+//
+// On its own, and separate from `is_hex_run`, because it is the check
+// the specification states twice and the one an implementation omits: a
+// `traceparent` carrying thirty-two zeroes passes every length and
+// alphabet test there is.
+fn is_all_zero(s: Str) -> Bool []
+    var digit = false
+    for i in 0..str.len(s)
+        if str.byte_at_or(s, i, '0') != '0'
+            digit = true
+    not digit
+
+// id_usable is an id of this width, in lowercase hex, and NOT the
+// invalid all-zero one.
+//
+// THE ZERO CASE IS THE ONE WORTH PINNING.  An implementation that
+// checks length and alphabet accepts `-0000000000000000-` and silently
+// correlates every such request into a single trace — which is not a
+// degraded trace but a wrong one, and it is why the specification names
+// this value at all.
+fn id_usable(s: Str, width: Int) -> Bool []
+    is_hex_run(s, width) and not is_all_zero(s)
+
+// id_reason is WHICH of the two id faults a bad id has.
+//
+// Separately from the check, because they are separate alarms: a field
+// of the wrong length or alphabet is usually a middlebox mangling a
+// value, and an all-zero id is a caller whose own tracing is broken.
+fn id_reason(s: Str, width: Int, field: Str) -> TrPropReason []
+    if is_hex_run(s, width)
+        TrPropZeroId(field)
+    else
+        TrPropBadField(field)
+
+// refused is the answer to a header that will not yield a context: the
+// specification's invalid context, which is the caller's cue to mint a
+// new trace id, and `restart` true.
+fn refused(reason: TrPropReason) -> TrPropagation []
+    TrPropagation { context: trctx.invalid_context(), reason: reason, restart: true }
+
+// hex_digit is one hex digit, for any nibble.
+fn hex_digit(d: Int) -> Str []
+    let i = d & 15
+    str.slice("0123456789abcdef", i, i + 1)
+
+// flags_text is the `trace-flags` byte as the two lowercase hex digits
+// the header spells it with — `1` is `01` and not `1`, which is the
+// detail that makes a written header 55 characters every time.
+fn flags_text(flags: Int) -> Str []
+    hex_digit((flags & 255) >> 4) + hex_digit(flags & 255)
+
+// flags_value is those two digits back as a byte.
+fn flags_value(s: Str) -> Int []
+    hex_value(str.byte_at_or(s, 0, '0')) * 16 + hex_value(str.byte_at_or(s, 1, '0'))
+
+// state_entries is a `tracestate` split on its commas, trimmed, with
+// the empty entries dropped.
+//
+// Trimmed because the specification's grammar is `OWS` around `list`,
+// and empty because a header that arrives as `a=b,` or as `,` has one
+// entry and not two — and a caller that counted entries would otherwise
+// count a value that is not there.
+fn state_entries(tracestate: Str) -> [Str] []
+    var kept: [Str] = []
+    for part in str.split(tracestate, ",")
+        let text = str.trim(part)
+        if text != ""
+            kept = list.push(kept, text)
+    kept
+
+// state_key_of is the vendor key of one `tracestate` entry: everything
+// before the first `=`, or the whole entry when there is none — which
+// is what lets a caller compare an entry against a key without first
+// asking whether it has one.
+fn state_key_of(entry: Str) -> Str []
+    let at = str.index(entry, "=")
+    match at
+        Some(i) => str.slice(entry, 0, i)
+        None    => entry
+
+// state_value_of is everything after that first `=`, or the empty
+// string when there is none.
+fn state_value_of(entry: Str) -> Str []
+    let at = str.index(entry, "=")
+    match at
+        Some(i) => str.slice(entry, i + 1, str.len(entry))
+        None    => ""
+
+// state_trim is a `tracestate` cut to the specification's limits: 32
+// entries and 512 characters, dropped from the RIGHT.
+//
+// From the right because the header is ordered by recency and the
+// leftmost entry is the one written most recently; dropping from the
+// left is dropping the entry the caller just wrote.
+fn state_trim(tracestate: Str) -> Str []
+    var entries = state_entries(tracestate)
+    if list.len(entries) > 32
+        entries = list.take(entries, 32)
+    var text = str.join(entries, ",")
+    while str.len(text) > 512 and list.len(entries) > 1
+        entries = list.take(entries, list.len(entries) - 1)
+        text = str.join(entries, ",")
+    text
+
+// baggage_tail splits one baggage entry at its FIRST `=` into the key
+// and everything after it.  An entry with no `=` answers an empty key,
+// which is how an entry that will not parse is recognised.
+fn baggage_tail(entry: Str) -> (Str, Str) []
+    let text = str.trim(entry)
+    let at = str.index(text, "=")
+    match at
+        Some(i) => (str.slice(text, 0, i), str.slice(text, i + 1, str.len(text)))
+        None    => ("", "")
+
+// baggage_parses is whether an entry of a `baggage` header would be
+// kept: a non-empty key before an `=`.
+fn baggage_parses(entry: Str) -> Bool []
+    let (key, _) = baggage_tail(entry)
+    key != ""
+
+// baggage_entry is one entry of a `baggage` header, or `None` for one
+// that will not parse.
+//
+// The properties tail after the first `;` is kept verbatim rather than
+// interpreted: the specification leaves its meaning to the vendor that
+// wrote it, and a hop that rewrote `;ttl=30` is a hop that broke
+// somebody's cache.
+fn baggage_entry(entry: Str) -> ?TrBaggage []
+    let (key, tail) = baggage_tail(entry)
+    if key == ""
+        return None
+    let semi = str.index(tail, ";")
+    match semi
+        Some(j) => Some(TrBaggage { key: key, value: str.slice(tail, 0, j),
+                                    properties: str.slice(tail, j + 1, str.len(tail)) })
+        None    => Some(TrBaggage { key: key, value: tail, properties: "" })
+
 // A context out of a `traceparent` and a `tracestate`.
 //
 // `tracestate` may be the empty string; it is never a reason to fail,
@@ -92,7 +261,47 @@ pub enum TrPropReason
 //     println("a context, off the wire")
 // ```
 pub fn extract(traceparent: Str, tracestate: Str) -> TrPropagation []
-    todo("tracing-nv.trprop.extract")
+    // An absent header is its own reason, and the commonest one: an
+    // uninstrumented caller is not a fault, and counting it beside the
+    // malformed ones makes a rollout look like an outage.
+    if traceparent == ""
+        return refused(TrPropAbsent)
+    let parts = str.split(traceparent, "-")
+    let count = list.len(parts)
+    let version = parts[0]
+    if not is_hex_run(version, 2)
+        return refused(TrPropBadField("version"))
+    // `ff` before the shape test, because the value is reserved
+    // whatever else the header says, and an operator counting reserved
+    // versions wants the truncated ones in the count.
+    if version == "ff"
+        return refused(TrPropReservedVersion)
+    if count < 4
+        return refused(TrPropBadShape(count))
+    // Version 00 is length-checked and a later version is not: the
+    // forward-compatibility rule says a receiver reads the four fields
+    // it knows and ignores the rest, which is exactly a version that
+    // may carry more than four.
+    if version == "00" and count != 4
+        return refused(TrPropBadShape(count))
+    let trace_id = parts[1]
+    let span_id = parts[2]
+    let flags = parts[3]
+    if not id_usable(trace_id, 32)
+        return refused(id_reason(trace_id, 32, "trace-id"))
+    if not id_usable(span_id, 16)
+        return refused(id_reason(span_id, 16, "span-id"))
+    if not is_hex_run(flags, 2)
+        return refused(TrPropBadField("trace-flags"))
+    // The tracestate is carried through verbatim and is never a reason
+    // to fail: the specification says an unparseable one is dropped and
+    // the traceparent is honoured, and the two rules are the difference
+    // between a lost vendor entry and a lost trace.
+    let context = trctx.span_context(trace_id, span_id, flags_value(flags), tracestate, true)
+    var reason: TrPropReason = TrPropOk
+    if version != "00"
+        reason = TrPropFutureVersion(version)
+    TrPropagation { context: context, reason: reason, restart: false }
 
 // The `traceparent` header for this context.
 //
@@ -112,7 +321,13 @@ pub fn extract(traceparent: Str, tracestate: Str) -> TrPropagation []
 //     println("the traceparent a client sends")
 // ```
 pub fn inject_traceparent(c: TrSpanContext) -> Str []
-    todo("tracing-nv.trprop.inject_traceparent")
+    // The all-zero header rather than an empty string, because "no
+    // header" and "a header naming the invalid trace" are different
+    // things to a downstream service and only the caller knows which
+    // one it means to say.
+    if not trctx.is_valid(c)
+        return "00-" + trctx.invalid_trace_id() + "-" + trctx.invalid_span_id() + "-00"
+    "00-" + c.trace_id + "-" + c.span_id + "-" + flags_text(c.flags)
 
 // The `tracestate` header for this context.
 //
@@ -131,7 +346,7 @@ pub fn inject_traceparent(c: TrSpanContext) -> Str []
 //     println("the tracestate a client sends")
 // ```
 pub fn inject_tracestate(c: TrSpanContext) -> Str []
-    todo("tracing-nv.trprop.inject_tracestate")
+    c.trace_state
 
 // A `tracestate` with this vendor's entry set, moved to the front.
 //
@@ -151,7 +366,15 @@ pub fn inject_tracestate(c: TrSpanContext) -> Str []
 //     println("a tracestate, with this vendor first")
 // ```
 pub fn state_set(tracestate: Str, key: Str, value: Str) -> Str []
-    todo("tracing-nv.trprop.state_set")
+    // The new entry first, so this vendor's own write is at the front
+    // whatever order the rest arrive in — the ordering rule is the
+    // header's semantics and this is the one place a library may change
+    // it.
+    var entries: [Str] = [key + "=" + value]
+    for text in state_entries(tracestate)
+        if state_key_of(text) != key
+            entries = list.push(entries, text)
+    state_trim(str.join(entries, ","))
 
 // The value this vendor wrote into a `tracestate`, or `None`.
 //
@@ -165,7 +388,10 @@ pub fn state_set(tracestate: Str, key: Str, value: Str) -> Str []
 //     println("a vendor's own tracestate entry")
 // ```
 pub fn state_get(tracestate: Str, key: Str) -> ?Str []
-    todo("tracing-nv.trprop.state_get")
+    for text in state_entries(tracestate)
+        if state_key_of(text) == key
+            return Some(state_value_of(text))
+    None
 
 // A `tracestate` with this vendor's entry removed.
 //
@@ -179,7 +405,11 @@ pub fn state_get(tracestate: Str, key: Str) -> ?Str []
 //     println("a tracestate, with one vendor dropped")
 // ```
 pub fn state_remove(tracestate: Str, key: Str) -> Str []
-    todo("tracing-nv.trprop.state_remove")
+    var kept: [Str] = []
+    for text in state_entries(tracestate)
+        if state_key_of(text) != key
+            kept = list.push(kept, text)
+    str.join(kept, ",")
 
 // Is this `tracestate` one the specification allows?
 //
@@ -198,7 +428,23 @@ pub fn state_remove(tracestate: Str, key: Str) -> Str []
 //     println("whether a tracestate is within the limits")
 // ```
 pub fn state_is_valid(tracestate: Str) -> Bool []
-    todo("tracing-nv.trprop.state_is_valid")
+    // An absent header is a header within the limits: the caller omits
+    // it rather than sending an empty one, and this predicate is asked
+    // before every send.
+    if tracestate == ""
+        return true
+    if str.len(tracestate) > 512
+        return false
+    let entries = state_entries(tracestate)
+    if list.len(entries) > 32
+        return false
+    for text in entries
+        let k = state_key_of(text)
+        // An entry with no `=` at all, or one whose key is empty before
+        // an `=`, is not a vendor entry: a backend cannot file either.
+        if k == "" or k == text
+            return false
+    true
 
 // The `baggage` header for this context's baggage entries.
 //
@@ -215,7 +461,15 @@ pub fn state_is_valid(tracestate: Str) -> Bool []
 //     println("the baggage a client sends")
 // ```
 pub fn inject_baggage(c: TrContext) -> Str []
-    todo("tracing-nv.trprop.inject_baggage")
+    var parts: [Str] = []
+    for b in c.baggage
+        var text = b.key + "=" + b.value
+        // The entry's properties are the writer's, carried back out
+        // exactly as they arrived.
+        if b.properties != ""
+            text = text + ";" + b.properties
+        parts = list.push(parts, text)
+    str.join(parts, ",")
 
 // The context with the entries in a `baggage` header added to it.
 //
@@ -234,7 +488,15 @@ pub fn inject_baggage(c: TrContext) -> Str []
 //     println("a context, with baggage off the wire")
 // ```
 pub fn extract_baggage(c: TrContext, header: Str) -> TrContext []
-    todo("tracing-nv.trprop.extract_baggage")
+    var out = c
+    for part in str.split(header, ",")
+        // An entry that will not parse is skipped rather than fatal,
+        // for the same reason a malformed `traceparent` restarts: one
+        // middlebox mangling one entry must not cost the service the
+        // tenant id beside it.
+        if let Some(b) = baggage_entry(part)
+            out = trctx.with_baggage(out, b.key, b.value, b.properties)
+    out
 
 // How many entries in this `baggage` header would be skipped.
 //
@@ -248,7 +510,15 @@ pub fn extract_baggage(c: TrContext, header: Str) -> TrContext []
 //     println("the baggage entries that would not parse")
 // ```
 pub fn baggage_dropped(header: Str) -> Int []
-    todo("tracing-nv.trprop.baggage_dropped")
+    // An absent header has no entries to lose, which is not the same
+    // answer as a header with one unparseable entry in it.
+    if header == ""
+        return 0
+    var lost = 0
+    for part in str.split(header, ",")
+        if not baggage_parses(part)
+            lost = lost + 1
+    lost
 
 // The header name `traceparent`.
 //
@@ -264,7 +534,7 @@ pub fn baggage_dropped(header: Str) -> Int []
 //     println(trprop.traceparent_header())
 // ```
 pub fn traceparent_header() -> Str []
-    todo("tracing-nv.trprop.traceparent_header")
+    "traceparent"
 
 // The header name `tracestate`.
 //
@@ -275,7 +545,7 @@ pub fn traceparent_header() -> Str []
 //     println(trprop.tracestate_header())
 // ```
 pub fn tracestate_header() -> Str []
-    todo("tracing-nv.trprop.tracestate_header")
+    "tracestate"
 
 // The header name `baggage`.
 //
@@ -286,7 +556,7 @@ pub fn tracestate_header() -> Str []
 //     println(trprop.baggage_header())
 // ```
 pub fn baggage_header() -> Str []
-    todo("tracing-nv.trprop.baggage_header")
+    "baggage"
 
 // Why a propagation answered what it did, as one line for an operator.
 //
@@ -300,4 +570,14 @@ pub fn baggage_header() -> Str []
 //     println("why a trace restarted")
 // ```
 pub fn reason_message(r: TrPropReason) -> Str []
-    todo("tracing-nv.trprop.reason_message")
+    // One line per arm, and every one of them different: an operator
+    // grouping a log by this text is counting the arms, and two arms
+    // that read the same are two counts that cannot be told apart.
+    match r
+        TrPropOk               => "the traceparent parsed"
+        TrPropAbsent           => "no traceparent header; this request starts a trace"
+        TrPropReservedVersion  => "the traceparent version is ff, which the specification reserves"
+        TrPropFutureVersion(v) => "the traceparent version ${v} is newer than 00; its four known fields were read"
+        TrPropBadShape(n)      => "the traceparent has ${n} hyphen-separated fields, not the four the specification defines"
+        TrPropBadField(f)      => "the traceparent ${f} field is not the lowercase hex it must be"
+        TrPropZeroId(f)        => "the traceparent ${f} is all zeroes, which the specification calls invalid"

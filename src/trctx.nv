@@ -1,8 +1,6 @@
 // trctx.nv — the context a caller threads, and the reason there is no
 // thread-local anywhere in this package.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THERE ARE NO THREAD-LOCALS, AND THAT IS A DECISION RATHER THAN AN
 // OMISSION.  Every mainstream tracing library keeps the current span in
 // ambient storage so that instrumentation need not thread it: Rust's
@@ -102,7 +100,7 @@ pub struct TrBaggage
 //     println("${trctx.empty().active == None}")
 // ```
 pub fn empty() -> TrContext []
-    todo("tracing-nv.trctx.empty")
+    TrContext { active: None, baggage: [] }
 
 // The context with this span active.
 //
@@ -119,7 +117,10 @@ pub fn empty() -> TrContext []
 //     println("a context, with a span active in it")
 // ```
 pub fn with_active(c: TrContext, s: TrSpanContext) -> TrContext []
-    todo("tracing-nv.trctx.with_active")
+    // The baggage list is shared rather than copied, which is safe only
+    // because every function that changes it builds a new list: no row
+    // in this module writes into `c.baggage`.
+    TrContext { active: Some(s), baggage: c.baggage }
 
 // The active span context, or `None`.
 //
@@ -133,7 +134,7 @@ pub fn with_active(c: TrContext, s: TrSpanContext) -> TrContext []
 //     println("the span a context is inside")
 // ```
 pub fn active_of(c: TrContext) -> ?TrSpanContext []
-    todo("tracing-nv.trctx.active_of")
+    c.active
 
 // The context with one baggage entry added or replaced.
 //
@@ -152,7 +153,16 @@ pub fn active_of(c: TrContext) -> ?TrSpanContext []
 //     println("a context, carrying a tenant")
 // ```
 pub fn with_baggage(c: TrContext, key: Str, value: Str, properties: Str) -> TrContext []
-    todo("tracing-nv.trctx.with_baggage")
+    var kept: [TrBaggage] = []
+    for b in c.baggage
+        // Every entry under this key goes, not just the first: `baggage_of`
+        // answers one value, and a context holding two would answer
+        // differently depending on the order it was built in.
+        if b.key != key
+            kept = list.push(kept, b)
+    let added = TrBaggage { key: key, value: value, properties: properties }
+    let next = list.concat(kept, [added])
+    TrContext { active: c.active, baggage: next }
 
 // The baggage value under this key, or `None`.
 //
@@ -166,7 +176,10 @@ pub fn with_baggage(c: TrContext, key: Str, value: Str, properties: Str) -> TrCo
 //     println("a baggage value, looked up")
 // ```
 pub fn baggage_of(c: TrContext, key: Str) -> ?Str []
-    todo("tracing-nv.trctx.baggage_of")
+    for b in c.baggage
+        if b.key == key
+            return Some(b.value)
+    None
 
 // The context with this baggage key removed.
 //
@@ -184,7 +197,13 @@ pub fn baggage_of(c: TrContext, key: Str) -> ?Str []
 //     println("a context, with one entry dropped")
 // ```
 pub fn without_baggage(c: TrContext, key: Str) -> TrContext []
-    todo("tracing-nv.trctx.without_baggage")
+    var kept: [TrBaggage] = []
+    for b in c.baggage
+        if b.key != key
+            kept = list.push(kept, b)
+    // A fresh list even when nothing matched, so the answer is a context
+    // the caller can pass on without the two sharing baggage storage.
+    TrContext { active: c.active, baggage: kept }
 
 // A span context built from its four parts.
 //
@@ -198,7 +217,8 @@ pub fn without_baggage(c: TrContext, key: Str) -> TrContext []
 // ```
 pub fn span_context(trace_id: Str, span_id: Str, flags: Int, trace_state: Str,
                     remote: Bool) -> TrSpanContext []
-    todo("tracing-nv.trctx.span_context")
+    TrSpanContext { trace_id: trace_id, span_id: span_id, flags: flags,
+                    trace_state: trace_state, remote: remote }
 
 // The invalid context the specification defines: all-zero ids, no
 // flags.
@@ -215,7 +235,37 @@ pub fn span_context(trace_id: Str, span_id: Str, flags: Int, trace_state: Str,
 //     println("${trctx.is_valid(trctx.invalid_context())}")
 // ```
 pub fn invalid_context() -> TrSpanContext []
-    todo("tracing-nv.trctx.invalid_context")
+    span_context(invalid_trace_id(), invalid_span_id(), 0, "", false)
+
+// is_hex_byte is whether a byte is one of the sixteen lowercase hex
+// digits.  Lowercase only: the specification's canonical form is
+// lowercase, and a header that arrives uppercase is not one a backend
+// will match against.
+fn is_hex_byte(b: Int) -> Bool []
+    b >= '0' and b <= '9' or b >= 'a' and b <= 'f'
+
+// is_all_zero is whether a string is nothing but the character `0`.
+//
+// Separately, because it is the check the specification states twice —
+// an all-zero trace id or span id is invalid whatever else is true of
+// it — and it is the one an implementation accepts by default: a
+// sixteen-zero span id passes every length and alphabet check there is.
+fn is_all_zero(s: Str) -> Bool []
+    var digit = false
+    for i in 0..str.len(s)
+        if str.byte_at_or(s, i, '0') != '0'
+            digit = true
+    not digit
+
+// is_hex_id is an id of exactly this width, in lowercase hex, and not
+// all zeroes.
+fn is_hex_id(s: Str, width: Int) -> Bool []
+    if str.len(s) != width
+        return false
+    for i in 0..width
+        if not is_hex_byte(str.byte_at_or(s, i, 0))
+            return false
+    not is_all_zero(s)
 
 // Is this a context a backend will accept?
 //
@@ -233,7 +283,10 @@ pub fn invalid_context() -> TrSpanContext []
 //     println("whether a context is one a backend will take")
 // ```
 pub fn is_valid(c: TrSpanContext) -> Bool []
-    todo("tracing-nv.trctx.is_valid")
+    // The trace state is not checked: the specification says an
+    // unparseable one is discarded, not that it invalidates the trace,
+    // and every vendor's grammar for it is its own.
+    is_hex_id(c.trace_id, 32) and is_hex_id(c.span_id, 16)
 
 // Is the sampled bit set?
 //
@@ -251,7 +304,7 @@ pub fn is_valid(c: TrSpanContext) -> Bool []
 //     println("whether a span will be exported")
 // ```
 pub fn is_sampled(c: TrSpanContext) -> Bool []
-    todo("tracing-nv.trctx.is_sampled")
+    (c.flags & 1) == 1
 
 // The context with the sampled bit set or cleared, and every other flag
 // left alone.
@@ -266,7 +319,12 @@ pub fn is_sampled(c: TrSpanContext) -> Bool []
 //     println("a context, with the sampled bit set")
 // ```
 pub fn set_sampled(c: TrSpanContext, on: Bool) -> TrSpanContext []
-    todo("tracing-nv.trctx.set_sampled")
+    var flags = c.flags
+    if on
+        flags = flags | 1
+    else
+        flags = flags & ~1
+    span_context(c.trace_id, c.span_id, flags, c.trace_state, c.remote)
 
 // The all-zero trace id, as text.
 //
@@ -280,7 +338,7 @@ pub fn set_sampled(c: TrSpanContext, on: Bool) -> TrSpanContext []
 //     println(trctx.invalid_trace_id())
 // ```
 pub fn invalid_trace_id() -> Str []
-    todo("tracing-nv.trctx.invalid_trace_id")
+    str.repeat("0", 32)
 
 // The all-zero span id, as text.
 //
@@ -291,4 +349,4 @@ pub fn invalid_trace_id() -> Str []
 //     println(trctx.invalid_span_id())
 // ```
 pub fn invalid_span_id() -> Str []
-    todo("tracing-nv.trctx.invalid_span_id")
+    str.repeat("0", 16)

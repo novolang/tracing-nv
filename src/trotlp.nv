@@ -1,7 +1,5 @@
 // trotlp.nv — the OTLP/JSON encoding, and the one exporter that ships.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE ENCODING IS PURE AND THE SEND IS NOT, AND THEY ARE SEPARATE
 // FUNCTIONS.  `encode` answers the exact JSON document a collector
 // receives, at `[]`, so a test asserts on the bytes without a collector
@@ -34,7 +32,17 @@
 // specification.  The cost is size — a JSON span is roughly three times
 // its protobuf — and it is named in the README rather than discovered
 // from an egress bill.
+//
+// THE JSON IS BUILT BY HAND, AND `std.json` IS WHY THAT NEEDS SAYING.
+// The standard library's encoder takes an assembled tree of value
+// handles, so this document would be a nest of `json.object` and
+// `json.array` calls around the OTLP wrappers — more code for the same
+// bytes.  What matters either way is the escaping, and that is one
+// function here: `json_str` escapes the quote, the backslash and every
+// byte below 0x20 and writes every other byte through unchanged, so a
+// UTF-8 attribute value reaches the collector byte for byte.
 
+use trexport
 use trspan
 
 // The resource attributes every span in a document is reported under.
@@ -82,18 +90,152 @@ impl TracingExporter[net] for TrOtlpExporter
     // because splitting changes how many requests a collector sees and
     // that is the caller's decision to make.
     fn export(self, spans: [TrSpan]) -> TrExportOutcome [net]
-        todo("tracing-nv.trotlp.TrOtlpExporter.export")
+        // A batch of none is a no-op, which is what lets a caller flush
+        // on a timer without a branch of its own.
+        if list.len(spans) == 0
+            return trexport.no_outcome()
+        if list.len(spans) > self.max_batch
+            return TrExportOutcome { sent: 0, dropped: list.len(spans),
+                                     fault: Some(TrExportTooLarge(list.len(spans), self.max_batch)) }
+        let document = encode(self.resource, self.scope, spans)
+        let answer = send(self.endpoint, document, self.timeout_seconds)
+        if trexport.outcome_is_clean(answer)
+            // `send` counts documents, because a document is all it can
+            // see; this is the layer that knows how many spans are in
+            // one, and a span count is what a caller of the trait reads.
+            //
+            // cov: skip — reachable only when a collector has answered a
+            // 2xx to this document, and a collector that ANSWERS cannot
+            // be simulated from one thread.  The collector that answers
+            // nothing is the case a suite holds, and it is the one that
+            // costs a service.
+            return TrExportOutcome { sent: list.len(spans), dropped: 0, fault: None }
+        answer
 
     // Nothing is held between calls — the batching is `trexport`'s — so
     // this answers a zero outcome.  Declared anyway, because the trait
     // requires it and because a caller that calls it on the way out
     // should not have to know which exporter holds state.
     fn flush(self) -> TrExportOutcome [net]
-        todo("tracing-nv.trotlp.TrOtlpExporter.flush")
+        // Nothing is held between calls — the batching is `trexport`'s
+        // and the connection is closed inside `send` — so there is
+        // nothing to drain.
+        trexport.no_outcome()
 
     // Stop accepting.
     fn shutdown(self) -> TrExportOutcome [net]
-        todo("tracing-nv.trotlp.TrOtlpExporter.shutdown")
+        // Nothing is kept open, so stopping and flushing are the same
+        // answer.
+        trexport.no_outcome()
+
+// One string as a JSON string literal: the quote, the backslash and
+// every control byte below 0x20 escaped, every other byte written
+// through unchanged, so a UTF-8 attribute value survives byte for byte.
+fn json_str(s: Str) -> Str []
+    var out = "\""
+    for i in 0..str.len(s)
+        let b = str.byte_at_or(s, i, 0)
+        if b == '"' or b == '\\'
+            out = out + "\\" + str.slice(s, i, i + 1)
+        else
+            if b < 32
+                out = out + control_escape(b)
+            else
+                out = out + str.slice(s, i, i + 1)
+    out + "\""
+
+// A control byte's escape: the five short forms JSON defines, and
+// `\u00XX` for the rest of the range.
+fn control_escape(b: Int) -> Str []
+    if b == 8
+        return "\\b"
+    if b == 9
+        return "\\t"
+    if b == 10
+        return "\\n"
+    if b == 12
+        return "\\f"
+    if b == 13
+        return "\\r"
+    "\\u00" + hex_byte(b)
+
+// One byte as two lowercase hex digits.
+fn hex_byte(b: Int) -> Str []
+    hex_digit((b & 255) >> 4) + hex_digit(b & 15)
+
+fn hex_digit(d: Int) -> Str []
+    let i = d & 15
+    str.slice("0123456789abcdef", i, i + 1)
+
+// One attribute value in its OTLP wrapper: a one-key object naming the
+// type.  An integer is written as a STRING inside that object, because
+// the wire type is a 64-bit integer and a JSON number would lose its
+// last digits in every consumer with IEEE doubles.
+fn encode_value(v: TrAttrValue) -> Str []
+    match v
+        TrvStr(text)    => "{\"stringValue\":" + json_str(text) + "}"
+        TrvInt(n)       => "{\"intValue\":" + json_str(str.from_int(n)) + "}"
+        TrvFloat(f)     => "{\"doubleValue\":" + str.from_float(f) + "}"
+        TrvBool(flag)   => "{\"boolValue\":" + bool_text(flag) + "}"
+        TrvStrList(xs)  => "{\"arrayValue\":{\"values\":" + str_values(xs) + "}}"
+        TrvIntList(xs)  => "{\"arrayValue\":{\"values\":" + int_values(xs) + "}}"
+        TrvBoolList(xs) => "{\"arrayValue\":{\"values\":" + bool_values(xs) + "}}"
+
+fn bool_text(b: Bool) -> Str []
+    if b
+        "true"
+    else
+        "false"
+
+// One array value's elements: every one of them an `AnyValue` of its
+// own, because OTLP's `arrayValue` holds `values` of `AnyValue` and a
+// bare JSON scalar in that position is a document a collector cannot
+// decode.  Each arm calls `encode_value`, so the element shape is the
+// scalar shape and cannot drift from it.
+fn str_values(xs: [Str]) -> Str []
+    let parts = list.map(xs, s => encode_value(TrvStr(s)))
+    "[" + str.join(parts, ",") + "]"
+
+fn int_values(xs: [Int]) -> Str []
+    let parts = list.map(xs, n => encode_value(TrvInt(n)))
+    "[" + str.join(parts, ",") + "]"
+
+fn bool_values(xs: [Bool]) -> Str []
+    let parts = list.map(xs, b => encode_value(TrvBool(b)))
+    "[" + str.join(parts, ",") + "]"
+
+fn encode_attrs(attrs: [TrAttr]) -> Str []
+    let parts = list.map(attrs, a => encode_attr(a))
+    "[" + str.join(parts, ",") + "]"
+
+fn encode_events(events: [TrEvent]) -> Str []
+    var parts: [Str] = []
+    for e in events
+        var one = "{\"name\":" + json_str(e.name)
+        one = one + ",\"timeUnixNano\":" + json_str(nanos_of(e.at_unix))
+        one = one + ",\"attributes\":" + encode_attrs(e.attributes) + "}"
+        parts = list.push(parts, one)
+    "[" + str.join(parts, ",") + "]"
+
+fn encode_links(links: [TrLink]) -> Str []
+    var parts: [Str] = []
+    for l in links
+        let ctx = l.context
+        var one = "{\"traceId\":" + json_str(ctx.trace_id)
+        one = one + ",\"spanId\":" + json_str(ctx.span_id)
+        one = one + ",\"attributes\":" + encode_attrs(l.attributes) + "}"
+        parts = list.push(parts, one)
+    "[" + str.join(parts, ",") + "]"
+
+fn span_objects(spans: [TrSpan]) -> Str []
+    let parts = list.map(spans, s => encode_span(s))
+    "[" + str.join(parts, ",") + "]"
+
+// The resource attributes: `service.name`, which OTLP requires, and then
+// whatever the operator put on every span.
+fn resource_attrs(r: TrResource) -> Str []
+    let named = list.concat([trspan.attr_str("service.name", r.service_name)], r.attributes)
+    encode_attrs(named)
 
 // The OTLP/JSON document for these spans.
 //
@@ -113,7 +255,10 @@ impl TracingExporter[net] for TrOtlpExporter
 //     println("the document a collector receives")
 // ```
 pub fn encode(resource: TrResource, scope: TrScope, spans: [TrSpan]) -> Str []
-    todo("tracing-nv.trotlp.encode")
+    "{\"resourceSpans\":[{\"resource\":{\"attributes\":" + resource_attrs(resource)
+     + "},\"scopeSpans\":[{\"scope\":{\"name\":" + json_str(scope.name)
+     + ",\"version\":" + json_str(scope.version)
+     + "},\"spans\":" + span_objects(spans) + "}]}]}"
 
 // One span as its OTLP/JSON object, without the wrapper.
 //
@@ -130,7 +275,25 @@ pub fn encode(resource: TrResource, scope: TrScope, spans: [TrSpan]) -> Str []
 //     println("one span, as OTLP JSON")
 // ```
 pub fn encode_span(s: TrSpan) -> Str []
-    todo("tracing-nv.trotlp.encode_span")
+    let ctx = s.context
+    var parent = ""
+    match s.parent
+        Some(p) =>
+            parent = ",\"parentSpanId\":" + json_str(p.span_id)
+        None    =>
+            parent = ""
+    var out = "{\"traceId\":" + json_str(ctx.trace_id)
+    out = out + ",\"spanId\":" + json_str(ctx.span_id)
+    out = out + parent
+    out = out + ",\"name\":" + json_str(s.name)
+    out = out + ",\"kind\":" + str.from_int(kind_code(s.kind))
+    out = out + ",\"startTimeUnixNano\":" + json_str(nanos_of(s.start_unix))
+    out = out + ",\"endTimeUnixNano\":" + json_str(nanos_of(s.end_unix))
+    out = out + ",\"attributes\":" + encode_attrs(s.attributes)
+    out = out + ",\"events\":" + encode_events(s.events)
+    out = out + ",\"links\":" + encode_links(s.links)
+    out = out + ",\"status\":{\"code\":" + str.from_int(status_code(s.status.code))
+    out + ",\"message\":" + json_str(s.status.description) + "}}"
 
 // A Unix epoch second as the nanosecond string OTLP wants.
 //
@@ -149,7 +312,11 @@ pub fn encode_span(s: TrSpan) -> Str []
 //     println(trotlp.nanos_of(1757548800.0))
 // ```
 pub fn nanos_of(unix_seconds: Float) -> Str []
-    todo("tracing-nv.trotlp.nanos_of")
+    // A billion nanoseconds in a second.  `float.to_int` truncates
+    // toward zero, which is what an instant after 1970 wants: a start
+    // and an end recorded to the same nanosecond stay equal rather than
+    // drifting a nanosecond apart in opposite directions.
+    str.from_int(float.to_int(unix_seconds * 1000000000.0))
 
 // The span kind as the OTLP enum number.
 //
@@ -164,7 +331,12 @@ pub fn nanos_of(unix_seconds: Float) -> Str []
 //     println("${trotlp.kind_code(TrServer)}")
 // ```
 pub fn kind_code(k: TrSpanKind) -> Int []
-    todo("tracing-nv.trotlp.kind_code")
+    match k
+        TrInternal => 1
+        TrServer   => 2
+        TrClient   => 3
+        TrProducer => 4
+        TrConsumer => 5
 
 // The status code as the OTLP enum number.
 //
@@ -175,7 +347,10 @@ pub fn kind_code(k: TrSpanKind) -> Int []
 //     println("${trotlp.status_code(TrError)}")
 // ```
 pub fn status_code(c: TrStatusCode) -> Int []
-    todo("tracing-nv.trotlp.status_code")
+    match c
+        TrUnset => 0
+        TrOk    => 1
+        TrError => 2
 
 // One attribute as its OTLP `KeyValue` object.
 //
@@ -191,7 +366,7 @@ pub fn status_code(c: TrStatusCode) -> Int []
 //     println(trotlp.encode_attr(trspan.attr_int("http.status_code", 200)))
 // ```
 pub fn encode_attr(a: TrAttr) -> Str []
-    todo("tracing-nv.trotlp.encode_attr")
+    "{\"key\":" + json_str(a.key) + ",\"value\":" + encode_value(a.value) + "}"
 
 // A resource: a service name and the attributes every span carries.
 //
@@ -202,7 +377,7 @@ pub fn encode_attr(a: TrAttr) -> Str []
 //     println(trotlp.resource("checkout", []).service_name)
 // ```
 pub fn resource(service_name: Str, attributes: [TrAttr]) -> TrResource []
-    todo("tracing-nv.trotlp.resource")
+    TrResource { service_name: service_name, attributes: attributes }
 
 // This package, as the scope a backend attributes spans to.
 //
@@ -213,7 +388,10 @@ pub fn resource(service_name: Str, attributes: [TrAttr]) -> TrResource []
 //     println(trotlp.this_scope().name)
 // ```
 pub fn this_scope() -> TrScope []
-    todo("tracing-nv.trotlp.this_scope")
+    // The version this file is released as, which is the manifest's
+    // `version` as well.  A bump is two places, which is why the
+    // CHANGELOG's `### Known` names it.
+    TrScope { name: "tracing-nv", version: "0.1.0" }
 
 // A scope a caller names.
 //
@@ -227,7 +405,7 @@ pub fn this_scope() -> TrScope []
 //     println(trotlp.scope("my-http-client", "1.2.0").version)
 // ```
 pub fn scope(name: Str, version: Str) -> TrScope []
-    todo("tracing-nv.trotlp.scope")
+    TrScope { name: name, version: version }
 
 // An exporter to this endpoint.
 //
@@ -240,7 +418,12 @@ pub fn scope(name: Str, version: Str) -> TrScope []
 //     println(x.endpoint)
 // ```
 pub fn exporter(endpoint: Str, r: TrResource) -> TrOtlpExporter []
-    todo("tracing-nv.trotlp.exporter")
+    // Ten seconds: long enough for a loaded collector, short enough that
+    // a service's own shutdown is not held open by one.  512 is the
+    // batch `trexport.default_limits()` fills a queue at, so the default
+    // exporter takes every batch the default batching produces.
+    TrOtlpExporter { endpoint: endpoint, resource: r, scope: this_scope(),
+                     timeout_seconds: 10.0, max_batch: 512 }
 
 // The same exporter with a different deadline.
 //
@@ -254,7 +437,11 @@ pub fn exporter(endpoint: Str, r: TrResource) -> TrOtlpExporter []
 //     println("${x.timeout_seconds}")
 // ```
 pub fn with_timeout(x: TrOtlpExporter, seconds: Float) -> TrOtlpExporter []
-    todo("tracing-nv.trotlp.with_timeout")
+    // Stored as given: `send` is where a deadline becomes milliseconds
+    // and where a non-positive one is floored, so what a caller reads
+    // back here is what the caller set.
+    TrOtlpExporter { endpoint: x.endpoint, resource: x.resource, scope: x.scope,
+                     timeout_seconds: seconds, max_batch: x.max_batch }
 
 // The collector URL the environment names, by `std.otlp`'s own
 // convention.
@@ -278,7 +465,10 @@ pub fn with_timeout(x: TrOtlpExporter, seconds: Float) -> TrOtlpExporter []
 //     println("the collector the environment names")
 // ```
 pub fn endpoint_from_env() -> Str [io]
-    todo("tracing-nv.trotlp.endpoint_from_env")
+    // The same variable and the same default `std.otlp` reads,
+    // deliberately: two spellings of one endpoint is one too many, and
+    // the second is the one that goes missing.
+    env.get_or("OTLP_ENDPOINT", "http://localhost:4318")
 
 // The service name the environment names: `OTLP_SERVICE`, defaulting to
 // `novo-app`.
@@ -293,7 +483,9 @@ pub fn endpoint_from_env() -> Str [io]
 //     println("the service name the environment names")
 // ```
 pub fn service_from_env() -> Str [io]
-    todo("tracing-nv.trotlp.service_from_env")
+    // A span with no service name is filed under `unknown_service`,
+    // which is where telemetry goes to be ignored — hence a default.
+    env.get_or("OTLP_SERVICE", "novo-app")
 
 // Has the environment turned exporting off?
 //
@@ -308,7 +500,196 @@ pub fn service_from_env() -> Str [io]
 //     println("${trotlp.is_disabled("off")}")
 // ```
 pub fn is_disabled(endpoint: Str) -> Bool []
-    todo("tracing-nv.trotlp.is_disabled")
+    // Trimmed, because the endpoint is usually read out of a shell
+    // environment and `OTLP_ENDPOINT=" off "` is a disabling somebody
+    // typed.  The word itself is exact: `off` is a spelling, not a
+    // prefix, so `offline.example:4318` is still a URL.
+    str.trim(endpoint) == "off"
+
+// The host, the port, the path to post to, and the reason there is
+// nothing to post to — an empty problem for an endpoint this can reach,
+// and an empty host with the reason otherwise.
+//
+// A base URL, so the path is whatever the endpoint carried and then
+// `/v1/traces`: an endpoint that already names the full path produces
+// the doubled path `traces_path` warns about, which is a 404 the
+// collector writes and nobody reads.
+fn endpoint_parts(endpoint: Str) -> (Str, Int, Str, Str) []
+    let text = str.trim(endpoint)
+    if not str.starts_with(text, "http://")
+        return ("", 0, "",
+                "the endpoint " + text + " is not an http:// URL, and this exporter speaks cleartext HTTP only")
+    let rest = str.slice(text, 7, str.len(text))
+    let host_end = boundary(rest, 0)
+    let host = str.slice(rest, 0, host_end)
+    if host == ""
+        return ("", 0, "", "the endpoint " + text + " names no host")
+    // 4318 unless the endpoint says otherwise: the port the OTLP
+    // specification assigns to HTTP, and the one `OTLP_ENDPOINT`'s own
+    // default carries.
+    var port = 4318
+    var after = host_end
+    if str.byte_at_or(rest, host_end, 0) == ':'
+        let port_end = boundary(rest, host_end + 1)
+        let port_text = str.slice(rest, host_end + 1, port_end)
+        match str.to_int(port_text)
+            Some(n) =>
+                port = n
+            None    =>
+                return ("", 0, "",
+                            "the endpoint " + text + " has a port that is not a number: " + port_text)
+        after = port_end
+    var route = str.slice(rest, after, str.len(rest))
+    if route == "/"
+        route = ""
+    (host, port, route + traces_path(), "")
+
+// The index of the first `:` or `/` at or after `from`, or the length of
+// the string when there is neither — the two characters that end a host
+// and a port.
+fn boundary(s: Str, from: Int) -> Int []
+    for i in from..str.len(s)
+        let b = str.byte_at_or(s, i, 0)
+        if b == ':' or b == '/'
+            return i
+    str.len(s)
+
+// The HTTP/1.1 request that carries the document.
+//
+// Content-Length is the byte length of the document, which is the unit a
+// body length is measured in and the unit `str.len` answers — a UTF-8
+// attribute makes those two differ from a character count, and a
+// truncating collector is the result.
+fn request_of(host: Str, port: Int, route: Str, document: Str) -> Str []
+    "POST " + route + " HTTP/1.1\r\n"
+     + "Host: " + host + ":" + str.from_int(port) + "\r\n"
+     + "Content-Type: application/json\r\n"
+     + "Content-Length: " + str.from_int(str.len(document)) + "\r\n"
+     + "User-Agent: tracing-nv\r\n"
+     + "Connection: close\r\n"
+     + "\r\n"
+     + document
+
+// Seconds as the integer milliseconds `net` takes, floored at one
+// second: an exporter whose deadline is zero or negative is an exporter
+// that hangs on a collector that never answers, and hanging is the one
+// thing a telemetry path must never do to the service it measures.
+fn milliseconds_of(seconds: Float) -> Int []
+    let ms = float.to_int(seconds * 1000.0)
+    if ms < 1
+        return 1000
+    ms
+
+// Everything the collector writes back, read until it closes the
+// connection — the request asks for that with `Connection: close`, so
+// there is no length to parse and no keep-alive to get wrong.
+//
+// The round bound is a last resort against a server that streams
+// forever: 64 reads is a quarter of a megabyte, and an OTLP reply is a
+// line of headers.
+fn collect_reply(sock: Sock) -> Str [net]
+    var text = ""
+    var more = true
+    var rounds = 0
+    while more and rounds < 64
+        rounds = rounds + 1
+        match net.recv(sock, 4096)
+            // cov: skip — the arm that reads bytes needs a collector
+            // that ANSWERS, which cannot be simulated from one thread:
+            // the test would have to accept and write while this call
+            // sits in `recv`.  The arm it DOES reach — a deadline with
+            // nothing on the other end — is the one that hangs a
+            // service.
+            Some(chunk) =>
+                text = text + chunk
+            None        =>
+                more = false
+    text
+
+// The outcome for a document the socket would not take, and the close
+// that goes with it.
+//
+// cov: skip — reached only from the write-failure path in `post`
+fn write_failed(sock: Sock, host: Str, port: Int) -> TrExportOutcome [net]
+    net.close(sock)
+    TrExportOutcome { sent: 0, dropped: 0,
+                      fault: Some(TrExportUnreachable("the document could not be written to " + host + ":" + str.from_int(port))) }
+
+// The request, the answer, and the connection, once it is open.
+fn post(sock: Sock, host: Str, port: Int, route: Str, document: Str,
+        timeout_seconds: Float) -> TrExportOutcome [net]
+    net.set_recv_timeout(sock, milliseconds_of(timeout_seconds))
+    let request = request_of(host, port, route, document)
+    if not net.send(sock, request)
+        // cov: skip — a write that fails needs the connection to break
+        // between the connect above and this call, which no arrangement
+        // of this package's own sockets produces: a listener that never
+        // accepts still takes the bytes, and a listener that has closed
+        // never connects.
+        return write_failed(sock, host, port)
+    let text = collect_reply(sock)
+    net.close(sock)
+    if str.len(text) == 0
+        return TrExportOutcome { sent: 0, dropped: 0,
+                                 fault: Some(TrExportUnreachable("the collector at " + host + ":" + str.from_int(port) + " answered nothing within " + str.from_float(timeout_seconds) + " seconds")) }
+    // One, because one document is what this function can count; the
+    // exporter rewrites the number with the batch length it knows.
+    // cov: skip — needs a collector that answers, which the suite does
+    // not run; the collector that does NOT answer is the case a test
+    // can hold, and it is the one that hangs a service.
+    answered(text, 1)
+
+// The first line of a reply: the status line, which is the line the
+// status is read off.
+//
+// cov: skip — needs a collector that answers
+fn first_line(text: Str) -> Str []
+    match str.index(text, "\r\n")
+        Some(at) => str.slice(text, 0, at)
+        None     => text
+
+// The body of a reply, or an empty string when it carries none.
+//
+// cov: skip — needs a collector that answers
+fn body_of(text: Str) -> Str []
+    match str.index(text, "\r\n\r\n")
+        Some(at) => str.slice(text, at + 4, str.len(text))
+        None     => ""
+
+// The status and what to say about it.  A collector's error body is
+// where OTLP puts the reason — "no matching pipeline", "unknown
+// service" — so it is preferred to the reason phrase when there is one.
+//
+// cov: skip — needs a collector that answers
+fn reply_status(text: Str) -> (Int, Str) []
+    let parts = str.split(first_line(text), " ")
+    if list.len(parts) < 2
+        return (0, "the collector's answer was not an HTTP status line")
+    match str.to_int(parts[1])
+        Some(n) => (n, answer_detail(text, parts))
+        None    => (0, "the collector's answer was not an HTTP status line")
+
+// cov: skip — needs a collector that answers
+fn answer_detail(text: Str, parts: [Str]) -> Str []
+    let body = str.trim(body_of(text))
+    if body != ""
+        return body
+    let phrase = list.drop(parts, 2)
+    str.trim(str.join(phrase, " "))
+
+// What an answered request means.  A 2xx is the only clean answer; a
+// reply that is not a status line at all is unreachable rather than
+// refused, because a refusal is a collector that read the document and
+// said no.
+//
+// cov: skip — needs a collector that answers
+fn answered(text: Str, count: Int) -> TrExportOutcome []
+    let (status, detail) = reply_status(text)
+    if status >= 200 and status < 300
+        return TrExportOutcome { sent: count, dropped: 0, fault: None }
+    if status == 0
+        return TrExportOutcome { sent: 0, dropped: 0, fault: Some(TrExportUnreachable(detail)) }
+    TrExportOutcome { sent: 0, dropped: 0, fault: Some(TrExportRefused(status, detail)) }
 
 // POST an already-encoded document to a collector.
 //
@@ -327,7 +708,19 @@ pub fn is_disabled(endpoint: Str) -> Bool []
 //     println("a document, posted to a collector")
 // ```
 pub fn send(endpoint: Str, document: Str, timeout_seconds: Float) -> TrExportOutcome [net]
-    todo("tracing-nv.trotlp.send")
+    // `off` disables emission by the convention `std.otlp` keeps;
+    // offering it to a socket would be a DNS lookup for a host called
+    // `off`, which fails slowly and confusingly.
+    if is_disabled(endpoint)
+        return trexport.no_outcome()
+    let (host, port, route, problem) = endpoint_parts(endpoint)
+    if problem != ""
+        return TrExportOutcome { sent: 0, dropped: 0, fault: Some(TrExportUnreachable(problem)) }
+    let opened = net.connect_timeout(host, port, milliseconds_of(timeout_seconds))
+    match opened
+        None       => TrExportOutcome { sent: 0, dropped: 0,
+                                  fault: Some(TrExportUnreachable("no connection to " + host + ":" + str.from_int(port) + " within " + str.from_float(timeout_seconds) + " seconds")) }
+        Some(sock) => post(sock, host, port, route, document, timeout_seconds)
 
 // The path a traces document is POSTed to: `/v1/traces`.
 //
@@ -344,4 +737,4 @@ pub fn send(endpoint: Str, document: Str, timeout_seconds: Float) -> TrExportOut
 //     println(trotlp.traces_path())
 // ```
 pub fn traces_path() -> Str []
-    todo("tracing-nv.trotlp.traces_path")
+    "/v1/traces"

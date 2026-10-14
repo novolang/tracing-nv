@@ -1,8 +1,5 @@
 // trspan_tests.nv — a span as a value, and the states it can be in.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: tracing-nv.trspan.<fn>`.
-//
 // THE ASSERTION THIS SUITE EXISTS FOR is `is_finished`.  A span nobody
 // ended is the commonest tracing bug in production and it shows up as a
 // trace that is simply missing — no error, no log line, nothing.  With a
@@ -30,7 +27,7 @@ fn test_a_started_span_is_not_finished() [io]
     test.assert(s.kind == TrServer)
 
     test.case("it has no end, which is the state a leaked span is in")
-    test.assert(trspan.is_finished(s) == false)
+    test.assert(not trspan.is_finished(s))
     test.assert(s.end_unix == 0.0)
 
     test.case("and no duration to report")
@@ -99,7 +96,7 @@ fn test_an_event_records_an_instant_rather_than_a_duration() [io]
     test.assert(list.len(s.events) == 1)
 
     test.case("and the span is still open, because an event does not end anything")
-    test.assert(trspan.is_finished(s) == false)
+    test.assert(not trspan.is_finished(s))
 
 @test
 fn test_an_exception_is_recorded_where_a_backend_looks_for_it() [io]

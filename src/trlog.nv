@@ -1,7 +1,5 @@
 // trlog.nv — a log line and a span, findable from each other.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THIS MODULE IS THE REASON ANYBODY RUNS BOTH.  A trace tells an
 // operator that a request took four seconds and which call took them; a
 // log tells them what the code was complaining about while it did.
@@ -29,6 +27,8 @@
 
 use lgrecord
 use lgsink
+use trctx
+use trspan
 
 // The three field keys this module writes.
 //
@@ -45,7 +45,7 @@ use lgsink
 //     println(trlog.trace_id_key())
 // ```
 pub fn trace_id_key() -> Str []
-    todo("tracing-nv.trlog.trace_id_key")
+    "trace_id"
 
 // The span id field key.
 //
@@ -56,7 +56,7 @@ pub fn trace_id_key() -> Str []
 //     println(trlog.span_id_key())
 // ```
 pub fn span_id_key() -> Str []
-    todo("tracing-nv.trlog.span_id_key")
+    "span_id"
 
 // The trace flags field key.
 //
@@ -67,7 +67,7 @@ pub fn span_id_key() -> Str []
 //     println(trlog.trace_flags_key())
 // ```
 pub fn trace_flags_key() -> Str []
-    todo("tracing-nv.trlog.trace_flags_key")
+    "trace_flags"
 
 // The record with this span context's three correlation fields added.
 //
@@ -86,7 +86,16 @@ pub fn trace_flags_key() -> Str []
 //     println("a log record a trace can be found from")
 // ```
 pub fn with_trace(r: LgRecord, c: TrSpanContext) -> LgRecord []
-    todo("tracing-nv.trlog.with_trace")
+    // Nothing rather than zeroes.  An invalid context is an all-zero
+    // trace id, and a line carrying one LOOKS correlated and joins to
+    // nothing — which an operator reads as missing logs rather than as a
+    // trace that never existed.
+    if not trctx.is_valid(c)
+        return r
+    let joined = [lgrecord.field_str(trace_id_key(), c.trace_id),
+                  lgrecord.field_str(span_id_key(), c.span_id),
+                  lgrecord.field_int(trace_flags_key(), c.flags)]
+    lgrecord.with_fields(r, joined)
 
 // The record with the active span's correlation fields added, if there
 // is one.
@@ -105,7 +114,116 @@ pub fn with_trace(r: LgRecord, c: TrSpanContext) -> LgRecord []
 //     println("a log record joined to whatever span is active")
 // ```
 pub fn with_context(r: LgRecord, c: TrContext) -> LgRecord []
-    todo("tracing-nv.trlog.with_context")
+    // A context is optional inside, and a handler should not have to
+    // unwrap it at every line: a request with no span active gets its
+    // record back unchanged.
+    match trctx.active_of(c)
+        Some(s) => with_trace(r, s)
+        None    => r
+
+// The attribute key the level crosses under, in both directions.
+//
+// Not one of the three published keys: those are read by a collector's
+// correlation, and this one is read by a person asking a backend which
+// events were warnings.
+fn level_key() -> Str []
+    "level"
+
+// The text a span attribute value carries, and an empty string for a
+// value that carries none.  The level and the two ids are tokens, and a
+// number under one of their keys is not a token.
+fn text_of_value(v: TrAttrValue) -> Str []
+    match v
+        TrvStr(text) => text
+        _            => ""
+
+// The text a field carries, `None` for a field that is absent and for
+// one that is present with another type: an integer under `trace_id`
+// names no trace, and answering it as text would join a log line to a
+// trace that never existed.
+//
+// The type is matched rather than crossed through a string-answering
+// helper, because the helper's empty string for a value of another type
+// is indistinguishable from a field that IS text and empty — and the
+// first of those must not read as a trace id.
+fn text_of_field(r: LgRecord, key: Str) -> ?Str []
+    match lgrecord.field_of(r, key)
+        Some(LgvStr(text)) => Some(text)
+        _                  => None
+
+// A level from the token an attribute carries, `LgInfo` for a token that
+// is not a level at all: an event nobody can read a level off is not a
+// warning.
+fn level_named(text: Str) -> LgLevel []
+    match lgrecord.level_parse(text)
+        Some(l) => l
+        None    => LgInfo
+
+fn parse_level(v: TrAttrValue) -> LgLevel []
+    level_named(text_of_value(v))
+
+// The attributes without the level, and the level they named.
+//
+// The level attribute is CONSUMED rather than copied into the fields:
+// `level` is one of the four keys the JSON format reserves for a
+// record's own facts, so keeping it would print the level twice in one
+// line and `lgrecord.reserved_or_duplicate_keys` would say so.
+fn split_level(attrs: [TrAttr]) -> ([TrAttr], LgLevel) []
+    var rest: [TrAttr] = []
+    var level = LgInfo
+    for a in attrs
+        if a.key == level_key()
+            level = parse_level(a.value)
+        else
+            rest = list.push(rest, a)
+    (rest, level)
+
+// One field as one attribute — the same crossing `attr_value_of` makes,
+// under the same key, so the two directions agree about the shape.
+fn field_as_attr(f: LgField) -> TrAttr []
+    TrAttr { key: f.key, value: attr_value_of(f.value) }
+
+fn fields_as_attrs(fs: [LgField]) -> [TrAttr] []
+    list.map(fs, f => field_as_attr(f))
+
+// An integer list as text: `lgrecord` has four scalar value types and a
+// present-and-empty, so a span attribute that is an array has no arm to
+// cross into.  It is rendered rather than dropped — a field that
+// vanishes is worse than one that arrives as text — and the type is what
+// is lost.
+fn int_list_text(xs: [Int]) -> Str []
+    var out = ""
+    var first = true
+    for n in xs
+        if not first
+            out = out + ","
+        out = out + str.from_int(n)
+        first = false
+    "[" + out + "]"
+
+fn bool_list_text(xs: [Bool]) -> Str []
+    var out = ""
+    var first = true
+    for flag in xs
+        if not first
+            out = out + ","
+        out = out + str.from_bool(flag)
+        first = false
+    "[" + out + "]"
+
+// One attribute as one log field, typed across.
+fn field_of_attr(a: TrAttr) -> LgField []
+    match a.value
+        TrvStr(text)    => lgrecord.field_str(a.key, text)
+        TrvInt(n)       => lgrecord.field_int(a.key, n)
+        TrvFloat(x)     => lgrecord.field_float(a.key, x)
+        TrvBool(flag)   => lgrecord.field_bool(a.key, flag)
+        TrvStrList(xs)  => lgrecord.field_str(a.key, "[" + str.join(xs, ",") + "]")
+        TrvIntList(xs)  => lgrecord.field_str(a.key, int_list_text(xs))
+        TrvBoolList(xs) => lgrecord.field_str(a.key, bool_list_text(xs))
+
+fn fields_of_attrs(attrs: [TrAttr]) -> [LgField] []
+    list.map(attrs, a => field_of_attr(a))
 
 // The trace id a record carries, or `None`.
 //
@@ -123,7 +241,7 @@ pub fn with_context(r: LgRecord, c: TrContext) -> LgRecord []
 //     println("the trace a log line belongs to")
 // ```
 pub fn trace_id_of(r: LgRecord) -> ?Str []
-    todo("tracing-nv.trlog.trace_id_of")
+    text_of_field(r, trace_id_key())
 
 // The span id a record carries, or `None`.
 //
@@ -137,7 +255,7 @@ pub fn trace_id_of(r: LgRecord) -> ?Str []
 //     println("the span a log line belongs to")
 // ```
 pub fn span_id_of(r: LgRecord) -> ?Str []
-    todo("tracing-nv.trlog.span_id_of")
+    text_of_field(r, span_id_key())
 
 // Is this record already correlated?
 //
@@ -156,7 +274,14 @@ pub fn span_id_of(r: LgRecord) -> ?Str []
 //     println("whether a record already names its trace")
 // ```
 pub fn is_correlated(r: LgRecord) -> Bool []
-    todo("tracing-nv.trlog.is_correlated")
+    // The trace id decides, and it is read through `trace_id_of` rather
+    // than by asking whether the key is present: a record whose
+    // `trace_id` is an integer has a key and no trace, and calling that
+    // correlated would tell a caller to skip the correlation that would
+    // have fixed it.
+    match trace_id_of(r)
+        Some(_) => true
+        None    => false
 
 // A log record as a span event.
 //
@@ -176,7 +301,12 @@ pub fn is_correlated(r: LgRecord) -> Bool []
 //     println("a log line, carried inside the span it happened in")
 // ```
 pub fn as_event(r: LgRecord) -> TrEvent []
-    todo("tracing-nv.trlog.as_event")
+    let named = trspan.attr_str(level_key(), lgrecord.level_name(r.level))
+    let attrs = list.concat([named], fields_as_attrs(r.fields))
+    // The record's own time, not the caller's clock: an event that
+    // happened at 0.0 is an event nobody stamped, which is the same
+    // convention the record carries.
+    trspan.event(r.message, r.ts_unix, attrs)
 
 // The span with this log record recorded as an event on it.
 //
@@ -190,7 +320,7 @@ pub fn as_event(r: LgRecord) -> TrEvent []
 //     println("a span, carrying a log line")
 // ```
 pub fn attach(s: TrSpan, r: LgRecord) -> TrSpan []
-    todo("tracing-nv.trlog.attach")
+    trspan.with_event(s, as_event(r))
 
 // One log field value as one attribute value.
 //
@@ -209,7 +339,16 @@ pub fn attach(s: TrSpan, r: LgRecord) -> TrSpan []
 //     println("a log field value, as a span attribute value")
 // ```
 pub fn attr_value_of(v: LgValue) -> TrAttrValue []
-    todo("tracing-nv.trlog.attr_value_of")
+    // `LgvNone` becomes empty text rather than vanishing: OTLP has no
+    // null attribute value, and a field that disappeared would make "we
+    // looked and there was nothing" indistinguishable from "we did not
+    // look".
+    match v
+        LgvStr(text)  => TrvStr(text)
+        LgvInt(n)     => TrvInt(n)
+        LgvFloat(x)   => TrvFloat(x)
+        LgvBool(flag) => TrvBool(flag)
+        LgvNone       => TrvStr("")
 
 // Emit a record correlated to the active span, through a sink.
 //
@@ -233,7 +372,10 @@ pub fn attr_value_of(v: LgValue) -> TrAttrValue []
 // ```
 pub fn emit_correlated<S: LgSink[e]>(to: S, f: LgFilter, r: LgRecord,
                                      c: TrContext) -> Result<Bool, LgSinkFault> [e]
-    todo("tracing-nv.trlog.emit_correlated")
+    // One call, because the correlation is the step a handler forgets on
+    // the one line it added in a hurry — and forgetting it is invisible
+    // until somebody needs the line and cannot find it.
+    lgsink.emit_if(to, f, with_context(r, c))
 
 // Emit every event on a finished span as a log record, through a sink.
 //
@@ -256,7 +398,20 @@ pub fn emit_correlated<S: LgSink[e]>(to: S, f: LgFilter, r: LgRecord,
 //     println("a span's events, in the log")
 // ```
 pub fn events_into<S: LgSink[e]>(to: S, f: LgFilter, s: TrSpan) -> Result<Int, LgSinkFault> [e]
-    todo("tracing-nv.trlog.events_into")
+    // The span's own name is the target, so the lines group by the
+    // operation they happened in.  The first fault stops the pass, the
+    // same way `lgsink.emit_all` stops: writing the rest into a sink that
+    // has said it cannot is how a missing hour reads as a quiet one.
+    var written = 0
+    for e in s.events
+        let wrote = lgsink.emit_if(to, f, record_of_event(e, s.context, s.name))
+        match wrote
+            Ok(admitted) =>
+                if admitted
+                    written = written + 1
+            Err(fault)   =>
+                return Err(fault)
+    Ok(written)
 
 // A span event as a log record at this level, under this target.
 //
@@ -273,4 +428,12 @@ pub fn events_into<S: LgSink[e]>(to: S, f: LgFilter, s: TrSpan) -> Result<Int, L
 //     println("a span event, as a log record")
 // ```
 pub fn record_of_event(e: TrEvent, c: TrSpanContext, target: Str) -> LgRecord []
-    todo("tracing-nv.trlog.record_of_event")
+    // The round trip `as_event` starts, finished: the level comes back
+    // out of the attribute it crossed in, so a warning recorded as an
+    // event is still a warning when it reaches the log — a service that
+    // moved its instrumentation to events must not silently raise its
+    // floor.
+    let (attrs, level) = split_level(e.attributes)
+    let base = lgrecord.record(level, target, e.name)
+    let timed = lgrecord.stamped(base, e.at_unix)
+    with_trace(lgrecord.with_fields(timed, fields_of_attrs(attrs)), c)

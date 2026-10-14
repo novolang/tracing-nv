@@ -1,8 +1,5 @@
 // trlog_tests.nv — the join key, in both directions.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: tracing-nv.trlog.<fn>`.
-//
 // THE CASE WORTH THE FILE is the invalid context.  A log line carrying
 // an all-zero trace id LOOKS correlated and joins to nothing, so an
 // operator filters a backend by it, gets an empty result, and concludes
@@ -69,7 +66,7 @@ fn test_correlating_from_a_context_unwraps_the_optional_for_the_caller() [io]
 @test
 fn test_a_record_can_be_asked_whether_it_is_already_correlated() [io]
     test.case("a bare record is not")
-    test.assert(trlog.is_correlated(a_record()) == false)
+    test.assert(not trlog.is_correlated(a_record()))
 
     test.case("a correlated one is, which is how a framework and a handler avoid doing it twice")
     test.assert(trlog.is_correlated(trlog.with_trace(a_record(), a_context())))

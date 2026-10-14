@@ -1,7 +1,5 @@
 // trexport.nv — where a finished span goes, and what sending it costs.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `TracingExporter[e]` IS THE LOAD-BEARING INTERFACE, and the effect
 // parameter is why.  An exporter over HTTP costs `[net]`, one over a
 // unix socket costs `[io]`, one that writes a file costs `[fs]`, and one
@@ -34,6 +32,9 @@
 // drain in it; one that does not gets exactly the shape of the problem
 // it has to solve, rather than a thread it did not ask for.
 
+use trctx
+use trspan
+
 // Why an exporter could not send.
 //
 // Four, and none of them is "the span was bad": a span this package
@@ -65,7 +66,15 @@ impl Error for TrExportFault
     // A refusal names the status, because a 400 and a 429 lead to
     // opposite actions and "export failed" leads to neither.
     fn message(self) -> Str
-        todo("tracing-nv.trexport.TrExportFault.message")
+        // One line, and a refusal names its status: a 400 and a 429 lead
+        // to opposite actions and "export failed" leads to neither.
+        match self
+            TrExportUnreachable(detail)     => "the collector could not be reached: ${detail}"
+            TrExportRefused(status, detail) =>
+                "the collector refused the batch with status ${status}: ${detail}"
+            TrExportClosed                  => "the exporter was shut down before this batch arrived"
+            TrExportTooLarge(count, limit)  =>
+                "the batch holds ${count} spans and this exporter takes ${limit}"
 
 // What one export did.
 //
@@ -102,6 +111,58 @@ pub trait TracingExporter[e]
     // both try to be tidy will do.
     fn shutdown(self) -> TrExportOutcome [e]
 
+// export_slots is the storage a `TrMemoryExporter` writes into: one list
+// of spans per slot number, held for the process rather than for the
+// exporter value.
+//
+// A module-level slot table rather than a field, because an exporter is
+// a VALUE and `TracingExporter` takes `self` by value — a struct that
+// held its spans would hand them back as a new value on every call, and
+// a test could never read what a pipeline it did not write the return
+// value of had sent.  This is the arrangement `lgring` uses for the same
+// reason: the caller owns the cell, the value names it, and the reading
+// call carries `[mutate]`.
+//
+// THE NAME IS PREFIXED, AND THAT IS A WORKAROUND.  A module-level `var`
+// is keyed by its bare name across every module of the assembly, so a
+// `var slots` here would BE `lgring`'s `var slots` — a list of log rings
+// — and every read below would be typed `LgRing`
+// (`language/two-modules-module-level-vars-of-one-name-are-one-variable`,
+// open).  `export_slots` is a name nothing else in the closure binds.
+// The prefix comes off when that filing closes, which is what the
+// CHANGELOG's `### Known` records.
+var export_slots: [[TrSpan]] = []
+
+// slot_spans is what a slot holds, or an empty list for a slot that has
+// never been written.
+//
+// An unwritten slot reads empty rather than faulting, which is what
+// makes `exported_spans` an assertion a test can write before anything
+// has been exported.
+fn slot_spans(slot: Int) -> [TrSpan] [mutate]
+    if slot < 0 or slot >= list.len(export_slots)
+        return []
+    export_slots[slot][:]
+
+// put_slot_spans replaces what a slot holds.
+//
+// The table grows to the slot asked for, so a caller may use slot 3
+// without creating 0, 1 and 2 first.  A negative slot is ignored rather
+// than refused: `slot` arrives from a caller's configuration, and the
+// alternative is a panic on the path of every span a service exports.
+fn put_slot_spans(slot: Int, spans: [TrSpan]) [mutate]
+    if slot < 0
+        return
+    while list.len(export_slots) <= slot
+        export_slots = list.push(export_slots, [])
+    var next: [[TrSpan]] = []
+    for i in 0..list.len(export_slots)
+        if i == slot
+            next = list.push(next, spans[:])
+        else
+            next = list.push(next, export_slots[i][:])
+    export_slots = next
+
 // An exporter that keeps the spans in a slot the caller owns.
 //
 // `impl TracingExporter[mutate]`, and it is the one every test uses: a
@@ -116,15 +177,38 @@ pub struct TrMemoryExporter
 impl TracingExporter[mutate] for TrMemoryExporter
     // Put the batch in the slot.
     fn export(self, spans: [TrSpan]) -> TrExportOutcome [mutate]
-        todo("tracing-nv.trexport.TrMemoryExporter.export")
+        // What is already in the slot comes through unchanged, so two
+        // exports in one test are two batches a test can read together.
+        let have = slot_spans(self.slot)
+        var all = list.concat(have, spans)
+        var kept = all
+        var lost = 0
+        // Over the cap the OLDEST go, which is what `cap`'s own comment
+        // says: a test reading the slot wants the spans its latest
+        // assertion was about.
+        if list.len(all) > self.cap
+            lost = list.len(all) - self.cap
+            kept = list.drop(all, lost)
+        put_slot_spans(self.slot, kept)
+        // What this export took from the batch it was handed, which is
+        // the count a caller retrying on a fault needs; the spans oldest
+        // out of the slot were counted when they went in.
+        var taken = list.len(spans) - lost
+        if taken < 0
+            taken = 0
+        TrExportOutcome { sent: taken, dropped: lost, fault: None }
 
     // Nothing is held back, so nothing is pushed.
     fn flush(self) -> TrExportOutcome [mutate]
-        todo("tracing-nv.trexport.TrMemoryExporter.flush")
+        no_outcome()
 
     // Stop accepting; the spans stay in the slot for the test to read.
     fn shutdown(self) -> TrExportOutcome [mutate]
-        todo("tracing-nv.trexport.TrMemoryExporter.shutdown")
+        // Nothing here has a closed state to set — the slot survives the
+        // program that filled it on purpose, and a second shutdown is
+        // then the same call as the first, which is the outcome the
+        // trait's own comment asks for.
+        no_outcome()
 
 // How a batch decides it is full.
 //
@@ -165,7 +249,7 @@ pub struct TrBatch
 //     println("${trexport.default_limits().max_batch}")
 // ```
 pub fn default_limits() -> TrBatchLimits []
-    todo("tracing-nv.trexport.default_limits")
+    limits(512, 5.0, 2048)
 
 // Limits a caller chose.
 //
@@ -176,7 +260,8 @@ pub fn default_limits() -> TrBatchLimits []
 //     println("${trexport.limits(128, 1.0, 4096).max_queue}")
 // ```
 pub fn limits(max_batch: Int, max_delay_seconds: Float, max_queue: Int) -> TrBatchLimits []
-    todo("tracing-nv.trexport.limits")
+    TrBatchLimits { max_batch: max_batch, max_delay_seconds: max_delay_seconds,
+                    max_queue: max_queue }
 
 // An empty batch under these limits.
 //
@@ -187,7 +272,10 @@ pub fn limits(max_batch: Int, max_delay_seconds: Float, max_queue: Int) -> TrBat
 //     println("${trexport.batch(trexport.default_limits()).dropped}")
 // ```
 pub fn batch(l: TrBatchLimits) -> TrBatch []
-    todo("tracing-nv.trexport.batch")
+    // `oldest_unix` is `0.0` and is set by the first push rather than
+    // here, because this call has no clock reading and a batch that
+    // stamped itself would charge `[time]` to a caller that has one.
+    TrBatch { spans: [], limits: l, oldest_unix: 0.0, dropped: 0 }
 
 // The batch with this span queued, or with it dropped and counted.
 //
@@ -205,7 +293,22 @@ pub fn batch(l: TrBatchLimits) -> TrBatch []
 //     println("a span, queued")
 // ```
 pub fn push(b: TrBatch, s: TrSpan, now_unix: Float) -> TrBatch []
-    todo("tracing-nv.trexport.push")
+    // An unsampled span is not queued and NOT counted as lost: the
+    // sampled bit is a decision that this span was never meant to
+    // travel, and a drop count that included it would report sampling
+    // as a fault.
+    if not trctx.is_sampled(s.context)
+        return b
+    if list.len(b.spans) >= b.limits.max_queue
+        return TrBatch { spans: b.spans, limits: b.limits,
+                         oldest_unix: b.oldest_unix, dropped: b.dropped + 1 }
+    let queued = list.concat(b.spans, [s])
+    // The age of the batch is the age of its OLDEST span, so it is set
+    // by the push that found the queue empty and by no other.
+    var since = b.oldest_unix
+    if list.len(b.spans) == 0
+        since = now_unix
+    TrBatch { spans: queued, limits: b.limits, oldest_unix: since, dropped: b.dropped }
 
 // Is it time to send?
 //
@@ -223,7 +326,17 @@ pub fn push(b: TrBatch, s: TrSpan, now_unix: Float) -> TrBatch []
 //     println("whether a batch is due")
 // ```
 pub fn should_flush(b: TrBatch, now_unix: Float) -> Bool []
-    todo("tracing-nv.trexport.should_flush")
+    // An empty batch is never due, however long it has been empty: a
+    // loop that flushed nothing on every iteration would send a request
+    // per iteration to a collector with no spans in it.
+    if list.len(b.spans) == 0
+        return false
+    if list.len(b.spans) >= b.limits.max_batch
+        return true
+    // `>=` rather than `>`: a five-second delay means five seconds, and
+    // a caller that reads the clock once a second would otherwise send
+    // at six.
+    now_unix - b.oldest_unix >= b.limits.max_delay_seconds
 
 // The spans to send and the emptied batch.
 //
@@ -241,7 +354,13 @@ pub fn should_flush(b: TrBatch, now_unix: Float) -> Bool []
 //     println("the spans due, taken")
 // ```
 pub fn drain(b: TrBatch) -> ([TrSpan], TrBatch) []
-    todo("tracing-nv.trexport.drain")
+    // The limits survive the drain, because a service's next batch is
+    // under the same ones; the age and the loss count do not, because
+    // both are about spans that have just left.
+    // The spans are answered as a COPY: a plain return hands the caller
+    // a list it may write, and the batch they came from is a plain
+    // parameter (E2038).
+    (b.spans[:], TrBatch { spans: [], limits: b.limits, oldest_unix: 0.0, dropped: 0 })
 
 // Drain the batch into an exporter, answering what it did.
 //
@@ -259,7 +378,12 @@ pub fn drain(b: TrBatch) -> ([TrSpan], TrBatch) []
 //     println("a batch, sent, charged what the exporter costs")
 // ```
 pub fn flush_into<X: TracingExporter[e]>(b: TrBatch, x: X) -> (TrExportOutcome, TrBatch) [e]
-    todo("tracing-nv.trexport.flush_into")
+    // The batch is emptied FIRST, so the spans a caller queues while the
+    // export is in flight land in the batch this call hands back rather
+    // than in the one being sent.
+    let (spans, rest) = drain(b)
+    let outcome = x.export(spans)
+    (outcome, rest)
 
 // Drain the batch into an exporter if it is due, and answer what it did.
 //
@@ -279,7 +403,13 @@ pub fn flush_into<X: TracingExporter[e]>(b: TrBatch, x: X) -> (TrExportOutcome, 
 // ```
 pub fn flush_if_due<X: TracingExporter[e]>(b: TrBatch, x: X,
                                            now_unix: Float) -> (TrExportOutcome, TrBatch) [e]
-    todo("tracing-nv.trexport.flush_if_due")
+    // The exporter is not touched at all when the batch is not due: a
+    // loop running a thousand times a second must not make a thousand
+    // calls a second into a collector, and an exporter that charged for
+    // the attempt would charge the caller for all of them.
+    if not should_flush(b, now_unix)
+        return (no_outcome(), b)
+    flush_into(b, x)
 
 // An in-memory exporter over a slot the caller owns.
 //
@@ -290,7 +420,10 @@ pub fn flush_if_due<X: TracingExporter[e]>(b: TrBatch, x: X,
 //     println("${trexport.memory_exporter(0, 1024).cap}")
 // ```
 pub fn memory_exporter(slot: Int, cap: Int) -> TrMemoryExporter []
-    todo("tracing-nv.trexport.memory_exporter")
+    // Constructing one touches nothing, which is what lets this row be
+    // `[]`: the slot is read and written by the calls that carry
+    // `[mutate]`, and a test builds the value wherever it likes.
+    TrMemoryExporter { slot: slot, cap: cap }
 
 // The spans an in-memory exporter is holding.
 //
@@ -304,7 +437,28 @@ pub fn memory_exporter(slot: Int, cap: Int) -> TrMemoryExporter []
 //     println("what a test's exporter received")
 // ```
 pub fn exported_spans(x: TrMemoryExporter) -> [TrSpan] [mutate]
-    todo("tracing-nv.trexport.exported_spans")
+    // A read and not a drain: an assertion is written against what the
+    // exporter received, and a read that emptied the slot would make the
+    // second assertion in a test see nothing.
+    slot_spans(x.slot)
+
+// Empty a slot, so an export run that is over leaves nothing behind.
+//
+// The counterpart to `exported_spans`, and the call a reader reaches for
+// when it is about to start over: the slot belongs to the caller, and a
+// caller that wants it empty says so rather than asserting on what an
+// earlier run left there.  A negative slot is ignored, as it is in
+// `memory_exporter`.
+//
+// ```novo
+// use trexport
+//
+// fn main() [io, mutate]
+//     trexport.clear_slot(0)
+//     println("slot 0 starts empty")
+// ```
+pub fn clear_slot(slot: Int) [mutate]
+    put_slot_spans(slot, [])
 
 // An outcome that sent nothing and failed at nothing.
 //
@@ -315,7 +469,7 @@ pub fn exported_spans(x: TrMemoryExporter) -> [TrSpan] [mutate]
 //     println("${trexport.no_outcome().sent}")
 // ```
 pub fn no_outcome() -> TrExportOutcome []
-    todo("tracing-nv.trexport.no_outcome")
+    TrExportOutcome { sent: 0, dropped: 0, fault: None }
 
 // Did this outcome get everything through?
 //
@@ -330,7 +484,10 @@ pub fn no_outcome() -> TrExportOutcome []
 //     println("${trexport.outcome_is_clean(trexport.no_outcome())}")
 // ```
 pub fn outcome_is_clean(o: TrExportOutcome) -> Bool []
-    todo("tracing-nv.trexport.outcome_is_clean")
+    // Three parts, and `sent > 0` is the one a two-part check leaves
+    // out: an idle loop that sent nothing and lost nothing is not a
+    // healthy export, it is an idle one.
+    o.sent > 0 and o.dropped == 0 and o.fault == None
 
 // Is this fault worth trying again?
 //
@@ -349,4 +506,12 @@ pub fn outcome_is_clean(o: TrExportOutcome) -> Bool []
 //     println("whether a failed export is worth repeating")
 // ```
 pub fn is_retryable(f: TrExportFault) -> Bool []
-    todo("tracing-nv.trexport.is_retryable")
+    // A refusal is split by status rather than retried whole: a 4xx is
+    // this side's fault and repeating it is how a broken encoder becomes
+    // an outage at the collector, while a 429 is the collector asking
+    // for less and a 5xx is the collector having a bad minute.
+    match f
+        TrExportUnreachable(_)     => true
+        TrExportRefused(status, _) => status == 429 or status >= 500 and status < 600
+        TrExportClosed             => false
+        TrExportTooLarge(_, _)     => false

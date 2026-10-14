@@ -1,7 +1,13 @@
 // trid.nv — the two things a trace cannot be built out of values alone:
 // an id nobody has used, and the time it is now.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// THE SEEDED HALF OF THIS MODULE IS A READING, NOT A WRITING.
+// `seeded_ids` derives a trace id and a span id from a seed and a step
+// with no effect row at all, so a test can name the ids it is about to
+// see; `seeded_tracer` cannot make `start_span` mint them, because a
+// `TrTracer` carries no id source for a counter to live in and
+// `start_span` is `[rand]`.  The gap is recorded at the site and in the
+// CHANGELOG's `### Known`.
 //
 // THIS MODULE IS WHERE THE EFFECTS ARE, ALL OF THEM.  Minting an id is
 // `[rand]`, reading the clock is `[time]`, and nothing else in this
@@ -18,14 +24,21 @@
 // bits for a trace and 64 for a span, which is the specification's
 // sizing and the reason the two are different calls.
 //
-// THE TRACER IS A VALUE.  `TrTracer` is a sampler, a resource-shaped
-// scope and the id source; `start_span` is the one call that puts them
-// together, and it is where the sampling decision is made — at the root
-// only, carried into the flags, so a child's decision is its parent's.
-// See `trsample`'s module note for why that is not an optimisation.
+// THE TRACER IS A VALUE.  `TrTracer` is a sampler and the instrumentation
+// scope its spans are attributed to; `start_span` is the one call that
+// puts them together, and it is where the sampling decision is made — at
+// the root only, carried into the flags, so a child's decision is its
+// parent's.  See `trsample`'s module note for why that is not an
+// optimisation.
 
 use trctx
 use trsample
+use trspan
+// `trotlp.this_scope()` is what `tracer` attributes its spans to, which
+// is why the scope's name and version are written down once in this
+// package rather than twice.
+use trotlp
+use trprop
 
 // What starts spans: a sampler, and the scope they are attributed to.
 //
@@ -47,7 +60,7 @@ pub struct TrTracer
 //     println(t.sampler.name)
 // ```
 pub fn tracer(s: TrSampler) -> TrTracer []
-    todo("tracing-nv.trid.tracer")
+    TrTracer { sampler: s, scope: trotlp.this_scope() }
 
 // A tracer attributed to a scope the caller names.
 //
@@ -65,7 +78,28 @@ pub fn tracer(s: TrSampler) -> TrTracer []
 //     println(t.scope.name)
 // ```
 pub fn tracer_for(s: TrSampler, sc: TrScope) -> TrTracer []
-    todo("tracing-nv.trid.tracer_for")
+    TrTracer { sampler: s, scope: sc }
+
+// hex_digit is one nibble as the lowercase hex digit it is written with.
+// The same four lines every hex-writing module in this package has, kept
+// private here because this one MINTS ids while the others format a
+// value they were handed.
+fn hex_digit(d: Int) -> Str []
+    let i = d & 15
+    str.slice("0123456789abcdef", i, i + 1)
+
+// hex_of_rand is an id of this many hex characters, drawn from the
+// machine's entropy.
+//
+// One draw per character: `rand.int(16)` is the only source this module
+// has, four bits at a time is the only way to fill a string of hex, and
+// the first character of a trace id is uniform over all sixteen values
+// rather than over the two a byte-at-a-time scheme leaves it.
+fn hex_of_rand(digits: Int) -> Str [rand]
+    var out = ""
+    for i in 0..digits
+        out = out + hex_digit(rand.int(16))
+    out
 
 // A new 128-bit trace id, as 32 lowercase hex characters.
 //
@@ -82,7 +116,7 @@ pub fn tracer_for(s: TrSampler, sc: TrScope) -> TrTracer []
 //     println("a trace id nobody has used")
 // ```
 pub fn new_trace_id() -> Str [rand]
-    todo("tracing-nv.trid.new_trace_id")
+    hex_of_rand(32)
 
 // A new 64-bit span id, as 16 lowercase hex characters.
 //
@@ -96,7 +130,7 @@ pub fn new_trace_id() -> Str [rand]
 //     println("a span id nobody has used")
 // ```
 pub fn new_span_id() -> Str [rand]
-    todo("tracing-nv.trid.new_span_id")
+    hex_of_rand(16)
 
 // The clock, as Unix epoch seconds.
 //
@@ -115,7 +149,7 @@ pub fn new_span_id() -> Str [rand]
 //     println("one clock reading, where it is earned")
 // ```
 pub fn now_unix() -> Float [time]
-    todo("tracing-nv.trid.now_unix")
+    time.now()
 
 // A root span context: a new trace id, a new span id, no flags set.
 //
@@ -133,7 +167,12 @@ pub fn now_unix() -> Float [time]
 //     println("a root context")
 // ```
 pub fn root_context() -> TrSpanContext [rand]
-    todo("tracing-nv.trid.root_context")
+    // The zero flags are the whole point of the call: the sampled bit is
+    // the sampler's answer and is written by `start_span` once it has
+    // one, because a root minted sampled would make the children of a
+    // dropped root export — the one failure a downstream service cannot
+    // detect, since the ids on the wire look perfectly good.
+    trctx.span_context(new_trace_id(), new_span_id(), 0, "", false)
 
 // A child context: the parent's trace id and trace state, a new span id,
 // and the PARENT'S FLAGS unchanged.
@@ -152,7 +191,97 @@ pub fn root_context() -> TrSpanContext [rand]
 //     println("a child of a span in this process")
 // ```
 pub fn child_context(parent: TrSpanContext) -> TrSpanContext [rand]
-    todo("tracing-nv.trid.child_context")
+    // The flags and the trace state are the PARENT'S, copied and not
+    // recomputed: a child that re-rolled the decision would put half a
+    // trace in the backend, and a child that dropped the trace state
+    // would strip the vendor entries of every downstream hop.
+    //
+    // `remote` is false and not the parent's: this context was minted
+    // here, and the flag describes the context rather than its parent.
+    // The span this context belongs to is a continuation of a remote
+    // parent, but a backend reading the header of the NEXT hop has to
+    // find this process's own span in it, not the upstream one.
+    trctx.span_context(parent.trace_id, new_span_id(), parent.flags,
+                       parent.trace_state, false)
+
+// sampled_flag is the `trace-flags` byte for a decision: bit 0 set when
+// the span will be exported, zero otherwise.
+//
+// The reserved bits are written as zero rather than carried, because
+// this is where the byte is MINTED and only bit 0 has a meaning the
+// specification defines; a receiver is required to reject a flag it does
+// not know, so setting one here would make this process's own traces
+// unroutable.
+fn sampled_flag(d: TrDecision) -> Int []
+    if trsample.is_exported(d)
+        1
+    else
+        0
+
+// The span with these attributes and links added.
+//
+// Both of `start_span`'s lists, applied in one place so that a root and
+// a child are dressed the same way — which is the property a test that
+// asserts on a child's attributes is really relying on.
+fn dressed(s: TrSpan, attributes: [TrAttr], links: [TrLink]) -> TrSpan []
+    var out = trspan.with_attrs(s, attributes)
+    for l in links
+        out = trspan.with_link(out, l)
+    out
+
+// What a start answers: the span, the caller's context with it active,
+// and the recording gate.
+//
+// `with_active` rather than a context the caller builds, because the
+// span's own context is the thing that must become active and a caller
+// that rebuilt it by hand is one typo away from activating the parent.
+fn built(span: TrSpan, c: TrContext, recording: Bool) -> TrStarted []
+    TrStarted { span: span, context: trctx.with_active(c, span.context),
+                recording: recording }
+
+// A root: a new trace, the sampler's decision, and the decision's own
+// attributes and trace state on the span.
+//
+// The decision is written into the context rather than kept beside it,
+// so a header injected from this span says `sampled` iff the span will
+// be exported — a downstream service that trusts the header then makes
+// the same choice this one did.
+fn begin_root(t: TrTracer, c: TrContext, name: Str, kind: TrSpanKind, attributes: [TrAttr],
+              links: [TrLink], start_unix: Float) -> TrStarted [rand]
+    let trace_id = new_trace_id()
+    let span_id = new_span_id()
+    // `None` for the parent, which is what makes this the case a sampler
+    // exists for: a parent-based sampler answering a root has to fall
+    // back on its own rule, and that fallback belongs to the sampler
+    // rather than to this call.
+    let asked = trsample.params(None, trace_id, name, kind, attributes, links)
+    let answered = trsample.decide(t.sampler, asked)
+    let context = trctx.span_context(trace_id, span_id, sampled_flag(answered.decision),
+                                     answered.trace_state, false)
+    // The sampler's attributes first and the caller's after, so a ratio
+    // sampler's `sampling.ratio` cannot be shadowed by a caller that
+    // happens to use the same key for its own.
+    let all_attrs = list.concat(answered.attributes, attributes)
+    let span = dressed(trspan.start(name, kind, context, None, start_unix),
+                       all_attrs, links)
+    built(span, c, trsample.is_recorded(answered.decision))
+
+// A child: the parent's trace, a new span id, and the parent's flags.
+//
+// No sampler runs, which is the rule rather than a shortcut: the
+// decision was made where the trace started, this process only received
+// it, and re-rolling here is exactly how the spans of a trace a parent
+// already decided to keep go missing.
+fn begin_child(c: TrContext, parent: TrSpanContext, name: Str, kind: TrSpanKind,
+               attributes: [TrAttr], links: [TrLink], start_unix: Float) -> TrStarted [rand]
+    let context = child_context(parent)
+    let span = dressed(trspan.start(name, kind, context, Some(parent), start_unix),
+                       attributes, links)
+    // Recording is the parent's sampled bit read directly, not a fresh
+    // decision and not `trctx.is_sampled` on the child — the child's
+    // flags ARE the parent's, so the two agree today and reading the
+    // parent states the rule that keeps them agreeing.
+    built(span, c, trctx.is_sampled(parent))
 
 // Start a span under this context, running the sampler if it is a root.
 //
@@ -182,7 +311,13 @@ pub fn child_context(parent: TrSpanContext) -> TrSpanContext [rand]
 // ```
 pub fn start_span(t: TrTracer, c: TrContext, name: Str, kind: TrSpanKind, attributes: [TrAttr],
                   links: [TrLink], start_unix: Float) -> TrStarted [rand]
-    todo("tracing-nv.trid.start_span")
+    // The context decides, and nothing else does: an empty context is a
+    // root and a context with a span in it is a child, so a caller that
+    // forgot to thread the context it was given gets a new trace rather
+    // than a child of whatever ran last.
+    match trctx.active_of(c)
+        None    => begin_root(t, c, name, kind, attributes, links, start_unix)
+        Some(p) => begin_child(c, p, name, kind, attributes, links, start_unix)
 
 // What starting a span produced.
 //
@@ -216,7 +351,10 @@ pub struct TrStarted
 //     println("whether a span is worth attributes")
 // ```
 pub fn is_recording(s: TrStarted) -> Bool []
-    todo("tracing-nv.trid.is_recording")
+    // A field read rather than a decision: the sampler has already
+    // answered, and asking it again at the call site would get a
+    // different answer from a random one.
+    s.recording
 
 // Continue a trace that arrived from another process.
 //
@@ -239,15 +377,43 @@ pub fn is_recording(s: TrStarted) -> Bool []
 //     println("a context continuing a trace from upstream")
 // ```
 pub fn continue_trace(p: TrPropagation) -> TrContext []
-    todo("tracing-nv.trid.continue_trace")
+    // A restarted propagation contributes nothing, and the invalid
+    // context it carries must not become the active one: a caller that
+    // threaded it would inject an all-zero header downstream, which
+    // reads as a trace rather than as the absence of one.  `empty` makes
+    // the next span a root, which is what restarting means.
+    if p.restart
+        return trctx.empty()
+    // The upstream span is this process's parent for exactly one span:
+    // the first one started under this context, whose own context a
+    // caller then threads onwards.
+    trctx.with_active(trctx.empty(), p.context)
 
-// A tracer whose ids come from a fixed seed rather than the machine.
+// A tracer for a test: this sampler, and this package's own scope.
 //
-// `[]`, and it is what a test uses: the ids are derived from a counter
-// the caller supplies, so a whole trace is reproducible and an
-// assertion can name a span id.  It is NOT for production and the name
-// says so — two processes with the same seed mint the same trace ids,
-// which is exactly the property a backend cannot survive.
+// `[]`, so a suite builds one per case with no effect row at all — and
+// it is what makes the suites here possible: the sampler is fixed, so
+// what a test asserts is the sampling RULE (a child inherits, a dropped
+// root's children stay dropped) rather than the outcome of a ratio.
+//
+// THE SEED REACHES NOTHING, AND THAT IS THE INTERFACE RATHER THAN AN
+// UNFINISHED BODY.  A `TrTracer` is a sampler and a scope: it carries no
+// id source for a counter to live in, and `start_span` is `[rand]` and
+// cannot keep one of its own.  It is not merely a missing field, either
+// — two children of one parent present `start_span` with the same
+// tracer, the same context and no other state, so NO counter reachable
+// from this call could give them different ids, and a trace whose
+// siblings share a span id is worse than a trace with unpredictable
+// ones.
+//
+// `seeded_ids` is the half of the promise that can be kept, and it is
+// published for this reason: a test that wants to name an id derives it
+// there, and an assertion about the spans themselves is structural — a
+// child's trace id is its parent's, a child's span id is not.  The gap
+// is recorded in the CHANGELOG's `### Known`.
+//
+// It is NOT for production and the name says so: nothing here stops a
+// caller using it, so it is named for what it is.
 //
 // ```novo
 // use trid
@@ -257,15 +423,57 @@ pub fn continue_trace(p: TrPropagation) -> TrContext []
 //     trid.seeded_tracer(trsample.always_on(), 1)
 //
 // fn main() [io]
-//     println("a tracer whose ids a test can predict")
+//     println("a tracer a test can build with no effect row")
 // ```
 pub fn seeded_tracer(s: TrSampler, seed: Int) -> TrTracer []
-    todo("tracing-nv.trid.seeded_tracer")
+    // The seed is accepted, documented and dropped — see the note above.
+    // Smuggling it into the scope's version string would make it visible
+    // and would still not help: the step a counter needs is not a
+    // parameter of `start_span`, and the scope is exported text.
+    tracer(s)
 
-// The trace and span ids a seeded tracer would mint at this step.
+// seeded_word is one 32-bit word of a seeded id: the seed, the step and
+// a salt folded together and multiplied twice.
 //
-// `[]`, published so a test can assert on the ids it is about to see
-// rather than reading them back out of the span it just built.
+// Arithmetic rather than a random draw, because the point is that a
+// second process gets the same answer.  The multipliers are the usual
+// odd constants of a small integer hash and are not tuned: nothing here
+// resists an adversary and nothing needs to.
+//
+// The widths are what a test relies on: the seed and the step are used
+// to thirty bits each, so two different steps are two different words
+// for every step a fixture has any reason to name.
+fn seeded_word(seed: Int, step: Int, salt: Int) -> Int []
+    // Both multiplies are applied to a value under 2^30, which is what
+    // keeps the product inside a 64-bit integer however absurd the
+    // arguments are; the masks are what hold that true.
+    var x = ((seed & 1073741823) + salt * 4096) & 1073741823
+    x = (x * 40503 + (step & 1073741823) + 12345) & 1073741823
+    x = (x * 2654435761 + (seed & 65535) * 65536 + 1013904223) & 4294967295
+    x
+
+// seeded_hex8 is one eight-character word of a seeded id.
+fn seeded_hex8(seed: Int, step: Int, salt: Int) -> Str []
+    let x = seeded_word(seed, step, salt)
+    var out = ""
+    for i in 0..8
+        // Most significant nibble first, the order every hex id is
+        // written in.
+        let shift = (7 - i) * 4
+        out = out + hex_digit((x >> shift) & 15)
+    out
+
+// The trace and span ids for a seed and a step.
+//
+// `[]`, and pure: the same seed and step answer the same two ids in
+// every process, which is what a fixture needs.  The derivation is
+// FROZEN rather than merely deterministic — an assertion naming an id
+// written today keeps passing next year — so the arithmetic in
+// `seeded_word` is a published thing and not an implementation detail.
+//
+// It stands on its own because a tracer cannot mint these ids (see
+// `seeded_tracer`): what it is for is building the ids a span would
+// carry when the IDS are not what is under test.
 //
 // ```novo
 // use trid
@@ -274,7 +482,13 @@ pub fn seeded_tracer(s: TrSampler, seed: Int) -> TrTracer []
 //     trid.seeded_ids(seed, step)
 //
 // fn main() [io]
-//     println("the ids a seeded tracer will mint")
+//     println("the ids a seeded test can name")
 // ```
 pub fn seeded_ids(seed: Int, step: Int) -> (Str, Str) []
-    todo("tracing-nv.trid.seeded_ids")
+    // Four words for a trace and two for a span, which is the
+    // specification's sizing — 128 bits and 64 — and six different
+    // salts, so that no word of an id repeats another.
+    let trace_id = seeded_hex8(seed, step, 1) + seeded_hex8(seed, step, 2)
+                    + seeded_hex8(seed, step, 3) + seeded_hex8(seed, step, 4)
+    let span_id = seeded_hex8(seed, step, 5) + seeded_hex8(seed, step, 6)
+    (trace_id, span_id)

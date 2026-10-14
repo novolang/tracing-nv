@@ -1,9 +1,6 @@
 // trexport_tests.nv — the batch, and the trait the pipeline is written
 // against.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: tracing-nv.trexport.<fn>`.
-//
 // THE ASSERTION THE COMPILER MAKES is `ship` below: a pipeline declared
 // `[mutate]` over the in-memory exporter, whose impl supplies exactly
 // `[mutate]`.  If the effect parameter did not do what this package
@@ -57,7 +54,7 @@ fn test_a_batch_fills_and_then_is_due() [io]
     b = trexport.push(b, a_span(true), 1757548800.0)
 
     test.case("one span is not a full batch")
-    test.assert(trexport.should_flush(b, 1757548800.0) == false)
+    test.assert(not trexport.should_flush(b, 1757548800.0))
 
     b = trexport.push(b, a_span(true), 1757548800.1)
 
@@ -70,7 +67,7 @@ fn test_a_quiet_service_sends_on_the_delay_rather_than_never() [io]
     b = trexport.push(b, a_span(true), 1757548800.0)
 
     test.case("one span in a batch of 512 is not full")
-    test.assert(trexport.should_flush(b, 1757548800.0) == false)
+    test.assert(not trexport.should_flush(b, 1757548800.0))
 
     test.case("and five seconds later it is due anyway, with no sleep in this test")
     test.assert(trexport.should_flush(b, 1757548805.0))
@@ -126,7 +123,7 @@ fn test_an_outcome_is_not_a_result_because_a_partial_send_has_two_numbers() [io]
     test.assert(partial.dropped == 100)
 
     test.case("and a partial send is not clean, even though something went")
-    test.assert(trexport.outcome_is_clean(partial) == false)
+    test.assert(not trexport.outcome_is_clean(partial))
 
 @test
 fn test_retrying_the_wrong_fault_is_how_a_collector_falls_over() [io]
@@ -137,13 +134,13 @@ fn test_retrying_the_wrong_fault_is_how_a_collector_falls_over() [io]
     test.assert(trexport.is_retryable(TrExportRefused(429, "slow down")))
 
     test.case("a 400 is NOT — retrying a broken encoder forever is the outage")
-    test.assert(trexport.is_retryable(TrExportRefused(400, "malformed")) == false)
+    test.assert(not trexport.is_retryable(TrExportRefused(400, "malformed")))
 
     test.case("nor is a closed exporter")
-    test.assert(trexport.is_retryable(TrExportClosed) == false)
+    test.assert(not trexport.is_retryable(TrExportClosed))
 
     test.case("nor is a batch that was too large, which wants splitting rather than repeating")
-    test.assert(trexport.is_retryable(TrExportTooLarge(900, 512)) == false)
+    test.assert(not trexport.is_retryable(TrExportTooLarge(900, 512)))
 
 @test
 fn test_a_fault_reads_as_one_line() [io]
@@ -185,10 +182,16 @@ fn test_a_zero_outcome_is_what_an_idle_loop_answers() [io]
     test.assert(o.fault == None)
 
     test.case("and it is not clean, because clean means something got through")
-    test.assert(trexport.outcome_is_clean(o) == false)
+    test.assert(not trexport.outcome_is_clean(o))
 
 @test
 fn test_the_in_memory_exporter_hands_a_test_what_it_received() [io]
+    // The slot is process state, and the pipeline test above exports
+    // through slot 0; this test is about what a fresh exporter holds, so
+    // it clears the slot it is about first.  The call is the one line
+    // landing added to this suite — the assertions below are the
+    // release's own, unchanged.
+    trexport.clear_slot(0)
     let x = trexport.memory_exporter(0, 1024)
 
     test.case("the cap it was built with")

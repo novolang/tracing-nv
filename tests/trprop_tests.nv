@@ -1,9 +1,6 @@
 // trprop_tests.nv — the W3C headers, and the rule that a bad one is not
 // an error.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: tracing-nv.trprop.<fn>`.
-//
 // EVERY MALFORMED HEADER BELOW HAS ARRIVED AT A REAL ENDPOINT.  A
 // truncating proxy, a client that built the header by hand, a middlebox
 // that upgraded the version, a service whose own tracing was
@@ -26,7 +23,7 @@ fn test_the_specifications_own_example_parses() [io]
 
     test.case("it is accepted")
     test.assert(p.reason == TrPropOk)
-    test.assert(p.restart == false)
+    test.assert(not p.restart)
 
     test.case("the ids come off it")
     test.assert(p.context.trace_id == "4bf92f3577b34da6a3ce929d0e0e4736")
@@ -53,7 +50,7 @@ fn test_every_malformed_header_restarts_and_none_of_them_refuses() [io]
     test.case("the wrong number of fields")
     let shape = trprop.extract("00-4bf92f3577b34da6a3ce929d0e0e4736-01", "")
     test.assert(shape.restart)
-    test.assert(trctx.is_valid(shape.context) == false)
+    test.assert(not trctx.is_valid(shape.context))
 
     test.case("a trace id that is not hex")
     let hex = trprop.extract("00-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-00f067aa0ba902b7-01", "")
@@ -82,7 +79,7 @@ fn test_a_future_version_is_read_rather_than_refused() [io]
     test.assert(trctx.is_sampled(p.context))
 
     test.case("and it is NOT a restart, which is the forward-compatibility rule")
-    test.assert(p.restart == false)
+    test.assert(not p.restart)
 
 @test
 fn test_an_unparseable_tracestate_does_not_cost_the_traceparent() [io]

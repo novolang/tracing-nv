@@ -1,8 +1,5 @@
 // trsample_tests.nv — who decides, and what a decision means.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: tracing-nv.trsample.<fn>`.
-//
 // TWO PROPERTIES CARRY THIS FILE.  A ratio sampler must decide from the
 // TRACE ID and from nothing else, so that five services running the same
 // ratio agree about the same trace — a per-service coin at 0.1 over five
@@ -34,12 +31,12 @@ fn test_always_on_and_always_off_are_what_they_say() [io]
 @test
 fn test_the_three_decisions_are_three_different_things() [io]
     test.case("a dropped span is not recorded and not exported")
-    test.assert(trsample.is_recorded(TrDrop) == false)
-    test.assert(trsample.is_exported(TrDrop) == false)
+    test.assert(not trsample.is_recorded(TrDrop))
+    test.assert(not trsample.is_exported(TrDrop))
 
     test.case("a record-only span IS recorded and is NOT exported")
     test.assert(trsample.is_recorded(TrRecordOnly))
-    test.assert(trsample.is_exported(TrRecordOnly) == false)
+    test.assert(not trsample.is_exported(TrRecordOnly))
 
     test.case("and a sampled span is both")
     test.assert(trsample.is_recorded(TrRecordAndSample))
